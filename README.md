@@ -75,12 +75,14 @@ This code uses a lot of resources from the [Cross-image attention](https://githu
 ## Citation
 If you use this code for your research, please cite the following work: 
 ```
-@misc{chigot2025cactif,
-      title={Style Transfer with Diffusion Models for Synthetic-to-Real Domain Adaptation}, 
-      author={Estelle Chigot and Dennis G. Wilson and Meriem Ghrib and Thomas Oberlin},
-      year={2025},
-      eprint={2505.16360},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV} 
+@article{Chigot_2025,
+   title={Style transfer with diffusion models for synthetic-to-real domain adaptation},
+   journal={Computer Vision and Image Understanding},
+   volume={259},
+   pages={104445}
+   ISSN={1077-3142},
+   DOI={10.1016/j.cviu.2025.104445},
+   author={Chigot, Estelle and Wilson, Dennis G. and Ghrib, Meriem and Oberlin, Thomas},
+   year={2025},
 }
 ```
