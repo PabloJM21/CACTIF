@@ -99,7 +99,7 @@ class FreeUUNet2DConditionModel(UNet2DConditionModel):
         #   [batch,                    1, key_tokens]
         # this helps to broadcast it as a bias over attention scores, which will be in one of the following shapes:
         #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
-        #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
+        #   [batch * heads, query_tokens, key_tokens] (e.g. classic attention backends)
         if attention_mask is not None:
             # assume that mask is expressed as:
             #   (1 = keep,      0 = discard)
