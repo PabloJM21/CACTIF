@@ -50,9 +50,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         required=True,
         help=(
-            "Prompt-transfer strength in [0, 1]. "
-            "0 is conservative/no prompt transfer; "
-            "1 is maximum."
+            "Direct CACTIF swap guidance strength. "
+            "This value is passed as swap_guidance_scale without remapping."
         ),
     )
 
@@ -158,9 +157,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
-
-    if not 0.0 <= args.scale <= 1.0:
-        parser.error("--scale must be between 0 and 1.")
 
     if args.steps <= 0:
         parser.error("--steps must be > 0.")
