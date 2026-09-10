@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+import random
 import sys
 
 import torch
@@ -88,6 +89,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--style_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory of style images. If provided, one random style image "
+            "is selected for each input image and this overrides --style_image."
+        ),
+    )
+
+    parser.add_argument(
         "--name",
         type=str,
         default="CACTIF",
@@ -163,6 +174,9 @@ def parse_args() -> argparse.Namespace:
     if args.style_image is not None and not args.style_image.is_file():
         parser.error(f"Style image does not exist: {args.style_image}")
 
+    if args.style_dir is not None and not args.style_dir.is_dir():
+        parser.error(f"Style directory does not exist: {args.style_dir}")
+
     return args
 
 
@@ -177,6 +191,20 @@ def collect_content_images(content_dir: Path, image_format: str):
         raise SystemExit(f"No files with format '{image_format}' found in {content_dir}")
 
     return input_files
+
+
+def collect_style_images(style_dir: Path):
+    allowed_suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+    style_files = sorted(
+        path
+        for path in style_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in allowed_suffixes
+    )
+
+    if not style_files:
+        raise SystemExit(f"No style images found in {style_dir}")
+
+    return style_files
 
 
 def run_style_transfer(
@@ -231,6 +259,7 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     input_files = collect_content_images(content_dir, image_format)
+    style_files = collect_style_images(args.style_dir) if args.style_dir is not None else None
 
     if args.adain_class:
         print("Warning: --adain_class requires semantic labels; disabling it for this image-only CLI flow.")
@@ -253,7 +282,10 @@ def main() -> None:
     model = CACTIFModel(cfg)
     model.pipe.scheduler.set_timesteps(cfg.num_timesteps)
 
-    if args.style_image is None:
+    if style_files is not None:
+        print(f"Using random style reference per image from: {args.style_dir}")
+        print(f"Discovered {len(style_files)} style file(s).")
+    elif args.style_image is None:
         print("No --style_image provided: using each input image as its own style reference.")
     else:
         print(f"Using global style reference: {args.style_image}")
@@ -261,11 +293,18 @@ def main() -> None:
     print(f"Found {len(input_files)} input file(s).")
     print(f"Output folder: {output_dir}")
 
+    rng = random.Random(cfg.seed)
     for index, input_path in enumerate(input_files, start=1):
         output_path = output_dir / input_path.name
-        style_path = args.style_image if args.style_image is not None else input_path
+        if style_files is not None:
+            style_path = rng.choice(style_files)
+        else:
+            style_path = args.style_image if args.style_image is not None else input_path
 
-        print(f"[{index}/{len(input_files)}] {input_path.name} -> {output_path}")
+        print(
+            f"[{index}/{len(input_files)}] "
+            f"{input_path.name} style={style_path.name} -> {output_path}"
+        )
 
         run_style_transfer(
             model=model,
