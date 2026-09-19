@@ -102,42 +102,23 @@ class CACTIFModel:
             def attention_filtering(self, model_self: CACTIFModel, attn_map, V):
                 prc_values = model_self.config.filter_perc
 
-                # Determine attention map resolution
-                attn_h = int(np.sqrt(attn_map.shape[2] // 2))
-                attn_w = attn_h * 2
-                px_count = attn_map.shape[-1]
+                # attn_map: [B, heads, Q, K]   V: [B, heads, K, head_dim]
+                # Best-matching style key for every query token (summed over heads)
+                max_idx = attn_map[OUT_INDEX].abs().sum(dim=0).argmax(dim=-1)        # [Q]
 
-                # Get max attention index per pixel
-                max_map = attn_map[OUT_INDEX].abs().sum(dim=0)
-                max_idx = torch.argmax(max_map, dim=-1)
+                v_content = V[CONTENT_INDEX]                                          # [H, N, D]
+                v_style_at_max = V[STYLE_INDEX][:, max_idx]                           # [H, N, D] (gather)
 
-                # Rearrange for spatial manipulation
-                attn_map = rearrange(attn_map, 'b c (h w) d -> b c h w d', h=attn_h, w=attn_w)
+                cos = F.cosine_similarity(v_content.float(), v_style_at_max.float(), dim=-1, eps=1e-6)  # [H, N]
+                score = cos.abs().sum(dim=0)                                          # [N]
 
-                cos = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
-                cos_v_mean = []
+                # Filter the weakest prc_values fraction; everything stays on GPU, no syncs
+                threshold = torch.quantile(score, prc_values)
+                weak = score < threshold                                              # [N] bool
 
-                # Calculate cosine similarity for each pair of Vidx and Vargmax
-                for idx in range(px_count):
-                    idx = int(idx)
-                    v_x = V[CONTENT_INDEX][:, idx]
-                    v_max = V[STYLE_INDEX][:, max_idx[idx].item()]
-                    cos_v_idx = cos(v_x, v_max)
-                    cos_v_idx = torch.sum(torch.abs(cos_v_idx), dim=0)
-                    cos_v_mean.append(cos_v_idx)
-
-                # Remove a percentage prc_values of weak attention regions
-                tensor_mean = torch.tensor(cos_v_mean)
-                threshold = torch.quantile(tensor_mean, prc_values)
-                tensor_mean = torch.where(tensor_mean < threshold, 1, 0)
-                threshold_idx = torch.nonzero(tensor_mean).flatten().tolist()
-
-                # Replace weak attention regions with content values and attention maps
-                attn_map[OUT_INDEX][:, :, :, threshold_idx] = attn_map[CONTENT_INDEX][:, :, :, threshold_idx]
-                V[OUT_INDEX][:, threshold_idx] = V[CONTENT_INDEX][:, threshold_idx]
-
-                # Rearrange back to original shape
-                attn_map = rearrange(attn_map, 'b c h w d -> b c (h w) d', h=attn_h, w=attn_w)
+                # Replace weak regions with content attention / values
+                attn_map[OUT_INDEX] = torch.where(weak, attn_map[CONTENT_INDEX], attn_map[OUT_INDEX])
+                V[OUT_INDEX] = torch.where(weak[:, None], V[CONTENT_INDEX], V[OUT_INDEX])
 
                 return attn_map, V
 
