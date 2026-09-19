@@ -16,6 +16,10 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 def Fourier_filter(x, threshold, scale):
+
+    dtype = x.dtype
+    x = x.float()                                   # do the FFT in fp32 (no ComplexHalf)
+
     # FFT
     x_freq = fftn(x, dim=(-2, -1))
     x_freq = fftshift(x_freq, dim=(-2, -1))
@@ -31,7 +35,7 @@ def Fourier_filter(x, threshold, scale):
     x_freq = ifftshift(x_freq, dim=(-2, -1))
     x_filtered = ifftn(x_freq, dim=(-2, -1)).real
 
-    return x_filtered
+    return x_filtered.to(dtype)     # back to fp16 for the rest of the UNet
 
 
 class FreeUUNet2DConditionModel(UNet2DConditionModel):
