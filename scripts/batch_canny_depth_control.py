@@ -210,7 +210,7 @@ def run_style_transfer(
     style_img: Path,
     output_path: Path,
 ) -> None:
-    with torch.no_grad():
+    with torch.inference_mode():
         cfg.update_latents_path(content_img.stem, style_img.stem)
         latents_style, noise_style = load_or_invert_one_image(model.pipe, cfg, img_path=style_img, type_img="style")
         latents_content, noise_content = load_or_invert_one_image(model.pipe, cfg, img_path=content_img, type_img="content")
@@ -245,6 +245,11 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("CACTIF inference requires CUDA in this repository.")
+
+    # TF32 tensor cores (Ampere or newer GPUs)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     content_dir = args.content_dir
     output_dir = args.output_dir

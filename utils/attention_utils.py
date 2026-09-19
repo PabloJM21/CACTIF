@@ -20,19 +20,37 @@ def should_mix_keys_and_values(model, hidden_states: torch.Tensor) -> bool:
 
     return should_mix
 
+import torch.nn.functional as F
 
-def compute_scaled_dot_product_attention(Q, K, V, edit_map=False, is_cross=False, contrast_strength=1.0):
-    """ Compute the scale dot product attention, potentially with our contrasting operation. """
-    attn_weight = torch.softmax((Q @ K.transpose(-2, -1) / math.sqrt(Q.size(-1))), dim=-1)
-    
-    if edit_map and not is_cross:
-        attn_weight[OUT_INDEX] = torch.stack([
-            torch.clip(enhance_tensor(attn_weight[OUT_INDEX][head_idx], contrast_factor=contrast_strength),
-                       min=0.0, max=1.0)
-            for head_idx in range(attn_weight.shape[1])
-        ])
-        
-    return attn_weight @ V, attn_weight
+def compute_scaled_dot_product_attention(Q, K, V, edit_map=False, is_cross=False,
+                                         contrast_strength=1.0, return_maps=False):
+    """
+    Q, K, V: [B, H, N, D].
+    Returns (hidden_states, maps). `maps` is None unless return_maps=True in an edit layer,
+    in which case it is (attn_out, attn_content), each [H, N, N].
+    """
+    # Fused flash / mem-efficient kernel for all batch elements: never builds the N x N matrix.
+    hidden = F.scaled_dot_product_attention(Q, K, V)
+
+    if not (edit_map and not is_cross):
+        return hidden, None
+
+    # Explicit maps only for the elements that need them.
+    scale = 1.0 / math.sqrt(Q.size(-1))
+    a_out = torch.softmax((Q[OUT_INDEX] @ K[OUT_INDEX].transpose(-2, -1)) * scale, dim=-1)  # [H,N,N]
+
+    # Contrast, vectorised over heads (same broadcasting as your enhance_tensor)
+    mu = a_out.mean(dim=-1).unsqueeze(-2)                                                    # [H,1,N]
+    a_out = a_out.sub_(mu).mul_(contrast_strength).add_(mu).clamp_(0.0, 1.0)
+
+    if return_maps:
+        a_content = torch.softmax(
+            (Q[CONTENT_INDEX] @ K[CONTENT_INDEX].transpose(-2, -1)) * scale, dim=-1
+        )
+        return hidden, (a_out, a_content)   # caller overwrites hidden[OUT_INDEX] after filtering
+
+    hidden[OUT_INDEX] = a_out @ V[OUT_INDEX]
+    return hidden, None
 
 
 def enhance_tensor(tensor: torch.Tensor, contrast_factor: float = 1.67) -> torch.Tensor:

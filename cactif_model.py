@@ -99,28 +99,20 @@ class CACTIFModel:
                         "AttentionProcessor requires torch 2.0+. Please upgrade your torch installation."
                     )
 
-            def attention_filtering(self, model_self: CACTIFModel, attn_map, V):
-                prc_values = model_self.config.filter_perc
+            def attention_filtering(self, model_self, a_out, a_content, V):
+                prc = model_self.config.filter_perc
 
-                # attn_map: [B, heads, Q, K]   V: [B, heads, K, head_dim]
-                # Best-matching style key for every query token (summed over heads)
-                max_idx = attn_map[OUT_INDEX].abs().sum(dim=0).argmax(dim=-1)        # [Q]
+                max_idx = a_out.sum(dim=0).argmax(dim=-1)                      # [N]; abs() was a no-op (weights >= 0)
+                v_content = V[CONTENT_INDEX]                                    # [H,N,D]
+                v_style_at_max = V[STYLE_INDEX][:, max_idx]                     # [H,N,D]
 
-                v_content = V[CONTENT_INDEX]                                          # [H, N, D]
-                v_style_at_max = V[STYLE_INDEX][:, max_idx]                           # [H, N, D] (gather)
+                cos = F.cosine_similarity(v_content.float(), v_style_at_max.float(), dim=-1, eps=1e-6)
+                score = cos.abs().sum(dim=0)                                    # [N]
+                weak = score < torch.quantile(score, prc)                       # [N] bool, stays on GPU
 
-                cos = F.cosine_similarity(v_content.float(), v_style_at_max.float(), dim=-1, eps=1e-6)  # [H, N]
-                score = cos.abs().sum(dim=0)                                          # [N]
-
-                # Filter the weakest prc_values fraction; everything stays on GPU, no syncs
-                threshold = torch.quantile(score, prc_values)
-                weak = score < threshold                                              # [N] bool
-
-                # Replace weak regions with content attention / values
-                attn_map[OUT_INDEX] = torch.where(weak, attn_map[CONTENT_INDEX], attn_map[OUT_INDEX])
-                V[OUT_INDEX] = torch.where(weak[:, None], V[CONTENT_INDEX], V[OUT_INDEX])
-
-                return attn_map, V
+                a_out = torch.where(weak, a_content, a_out)                     # mask over key dim
+                v_out = torch.where(weak[:, None], v_content, V[OUT_INDEX])
+                return a_out, v_out
 
             def __call__(self,
                          attn,
@@ -183,19 +175,20 @@ class CACTIFModel:
                 key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
                 value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
                 
-                # Compute the cross attention and apply contrasting operation
-                hidden_states, attn_weight = attention_utils.compute_scaled_dot_product_attention(
+                do_edit = perform_swap and model_self.enable_edit and should_mix and not is_cross
+                use_filter = do_edit and model_self.config.filtering
+
+                hidden_states, maps = attention_utils.compute_scaled_dot_product_attention(
                     query, key, value,
-                    edit_map=perform_swap and model_self.enable_edit and should_mix,
+                    edit_map=do_edit,
                     is_cross=is_cross,
                     contrast_strength=model_self.config.contrast_strength,
+                    return_maps=use_filter,
                 )
-                
-                # Apply the filtering operation from CACTIF
-                if model_self.config.filtering:
-                    if perform_swap and not is_cross and "up" in self.place_in_unet and model_self.enable_edit and should_mix:
-                        attn_weight, value = self.attention_filtering(model_self, attn_weight, value)
-                        hidden_states = attn_weight @ value
+
+                if use_filter:
+                    a_out, v_out = self.attention_filtering(model_self, *maps, value)
+                    hidden_states[OUT_INDEX] = a_out @ v_out      # only the OUT element changes
                 
                       
                 hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)

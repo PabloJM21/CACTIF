@@ -132,4 +132,7 @@ def get_init_latents_and_noises(model: CACTIFModel, cfg: RunConfig) -> Tuple[tor
         model.zs_content[cfg.skip_steps:]
     ]
 
+    dtype = model.pipe.unet.dtype
+    init_latents = init_latents.to(dtype)
+    init_zs = [z.to(dtype) for z in init_zs]
     return init_latents, init_zs
