@@ -148,88 +148,130 @@ class CACTIFModel:
 
             def attention_filtering(self, model_self: CACTIFModel, a_out, a_content, V):
                 """
-                Pixel-wise granularity (Class B-style) exported into Class A,
-                with runway-aware quantiles and correct non-square grid alignment.
-                a_out, a_content: [B, heads, N_q, N_k]
-                V: [B_variant, N_q, head_dim] (STYLE/CONTENT/OUT indices)
+                Hybrid filtering:
+                • Pixel-wise (original) INSIDE runway region
+                • Token-wise OUTSIDE runway region
+                Grid shape + runway mask alignment FIXED.
+                Supports both shapes:
+                    UNet:        [heads, N_q, N_k]
+                    Transformer: [B, heads, N_q, N_k]
                 """
 
-                # --- Compute per-query max-attended key index (Class B logic) ---
+                # ------------------------------------------------------------
+                # 0. Normalize shapes (add batch dim if missing)
+                # ------------------------------------------------------------
+                if a_out.dim() == 3:
+                    # UNet attention: [heads, N_q, N_k]
+                    a_out = a_out.unsqueeze(0)        # [1, heads, N_q, N_k]
+                    a_content = a_content.unsqueeze(0)
+                    V = {k: v.unsqueeze(0) for k, v in V.items()}
+                    added_batch = True
+                else:
+                    added_batch = False
+
+                B, H, N_q, N_k = a_out.shape
+
+                # ------------------------------------------------------------
+                # 1. Compute strongest-attended key per query (original logic)
+                # ------------------------------------------------------------
                 a_out_out = a_out[OUT_INDEX]                 # [B, heads, N_q, N_k]
                 max_map = a_out_out.abs().sum(dim=1)         # [B, N_q, N_k]
                 max_idx = max_map.argmax(dim=-1)             # [B, N_q]
 
-                # --- Gather content and style value vectors ---
+                # ------------------------------------------------------------
+                # 2. Gather content/style value vectors
+                # ------------------------------------------------------------
                 v_content = V[CONTENT_INDEX]                 # [B, N_q, D]
-                bsz, n_q, dim_v = v_content.shape
+                v_style   = V[STYLE_INDEX]                   # [B, N_q, D]
 
-                v_style = V[STYLE_INDEX]                     # [B, N_q, D]
-                idx_expanded = max_idx.unsqueeze(-1).expand(bsz, n_q, dim_v)
+                B, N_q, D = v_content.shape
+
+                idx_expanded = max_idx.unsqueeze(-1).expand(B, N_q, D)
                 v_style_at_max = torch.gather(v_style, 1, idx_expanded)  # [B, N_q, D]
 
-                # --- Cosine similarity per query token ---
+                # ------------------------------------------------------------
+                # 3. Cosine similarity per query token
+                # ------------------------------------------------------------
                 cos = F.cosine_similarity(
                     v_content.float(), v_style_at_max.float(), dim=-1, eps=1e-6
                 )                                            # [B, N_q]
                 score = cos.abs()                            # [B, N_q]
-                score_flat = score.reshape(-1)               # [B*N_q]
 
-                # ------------------------------------------------------------------
-                # FIXED: runway mask aligned to *true* non-square token grid
-                # ------------------------------------------------------------------
+                # ------------------------------------------------------------
+                # 4. FIXED: runway mask aligned to true non-square token grid
+                # ------------------------------------------------------------
                 rw = None
                 if model_self.runway_mask is not None:
-                    H_l, W_l = model_self.runway_mask.shape[-2:]   # latent resolution (e.g., 64×128)
+                    H_l, W_l = model_self.runway_mask.shape[-2:]   # latent resolution
 
-                    # Find integer downsampling factor f such that:
-                    #   (H_l/f) * (W_l/f) == N_q
-                    f = int(round((H_l * W_l / n_q) ** 0.5))
+                    # find integer f such that (H_l/f)*(W_l/f) == N_q
+                    f = int(round((H_l * W_l / N_q) ** 0.5))
 
-                    if (H_l // f) * (W_l // f) == n_q:
-                        # interpolate runway mask to token grid resolution
+                    if (H_l // f) * (W_l // f) == N_q:
                         m = F.interpolate(
                             model_self.runway_mask[None],
                             size=(H_l // f, W_l // f),
                             mode="area"
                         )                                       # [1,1,H',W']
                         rw = (m[0, 0] >= 0.5).flatten()          # [N_q]
-                        rw = rw.unsqueeze(0).expand(bsz, n_q)    # [B,N_q]
-                        rw = rw.reshape(-1)                      # [B*N_q]
+                        rw = rw.unsqueeze(0).expand(B, N_q)      # [B,N_q]
 
-                prc = model_self.config.filter_perc
+                # ------------------------------------------------------------
+                # 5. Hybrid thresholding: pixel-wise inside runway, token-wise outside
+                # ------------------------------------------------------------
+                prc  = model_self.config.filter_perc
                 rprc = model_self.runway_filter_perc
 
-                # --- Region-specific quantile thresholding (unchanged) ---
-                if rw is None or not rw.any():
-                    weak_flat = model_self.weak_below_quantile(score_flat, prc)
-                elif rw.all():
-                    weak_flat = model_self.weak_below_quantile(score_flat, rprc)
+                weak = torch.zeros_like(score, dtype=torch.bool)  # [B, N_q]
+
+                if rw is None:
+                    # No runway → pure token-wise (for speed)
+                    weak = model_self.weak_below_quantile(score, prc)
                 else:
-                    weak_flat = torch.zeros_like(rw, dtype=torch.bool)
-                    weak_flat[rw] = model_self.weak_below_quantile(score_flat[rw], rprc)
-                    weak_flat[~rw] = model_self.weak_below_quantile(score_flat[~rw], prc)
+                    # Flatten for quantile ops
+                    score_flat = score.reshape(-1)
+                    rw_flat    = rw.reshape(-1)
 
-                weak = weak_flat.view(bsz, n_q)                # [B, N_q]
+                    # Pixel-wise inside runway (original)
+                    if rw_flat.any():
+                        weak_rw = model_self.weak_below_quantile(score_flat[rw_flat], rprc)
+                        weak[rw] = weak_rw.reshape(-1)
 
-                # --- Apply filtering (unchanged) ---
-                a_out_out = a_out[OUT_INDEX]                   # [B, heads, N_q, N_k]
-                a_content_out = a_content[CONTENT_INDEX]       # [B, heads, N_q, N_k]
+                    # Token-wise outside runway (for speed)
+                    if (~rw_flat).any():
+                        weak_non = model_self.weak_below_quantile(score_flat[~rw_flat], prc)
+                        weak[~rw] = weak_non.reshape(-1)
 
-                weak_attn = weak.unsqueeze(1).unsqueeze(-1)    # [B,1,N_q,1]
-                weak_attn = weak_attn.expand_as(a_out_out)     # [B,heads,N_q,N_k]
+                # ------------------------------------------------------------
+                # 6. Apply filtering
+                # ------------------------------------------------------------
+                a_out_out      = a_out[OUT_INDEX]             # [B, heads, N_q, N_k]
+                a_content_out  = a_content[CONTENT_INDEX]     # [B, heads, N_q, N_k]
+
+                weak_attn = weak.unsqueeze(1).unsqueeze(-1)   # [B,1,N_q,1]
+                weak_attn = weak_attn.expand_as(a_out_out)    # [B,heads,N_q,N_k]
 
                 a_out_filtered = torch.where(weak_attn, a_content_out, a_out_out)
 
-                v_out = V[OUT_INDEX]                           # [B,N_q,D]
-                v_content = V[CONTENT_INDEX]                   # [B,N_q,D]
-                weak_v = weak.unsqueeze(-1).expand_as(v_out)   # [B,N_q,D]
+                v_out      = V[OUT_INDEX]                     # [B,N_q,D]
+                v_content  = V[CONTENT_INDEX]                 # [B,N_q,D]
+                weak_v     = weak.unsqueeze(-1).expand_as(v_out)
+
                 v_out_filtered = torch.where(weak_v, v_content, v_out)
 
                 # write back
                 a_out[OUT_INDEX] = a_out_filtered
-                V[OUT_INDEX] = v_out_filtered
+                V[OUT_INDEX]     = v_out_filtered
+
+                # ------------------------------------------------------------
+                # 7. Remove artificial batch dim if we added one
+                # ------------------------------------------------------------
+                if added_batch:
+                    a_out = a_out.squeeze(0)
+                    V = {k: v.squeeze(0) for k, v in V.items()}
 
                 return a_out, V
+
 
 
             def __call__(self,
