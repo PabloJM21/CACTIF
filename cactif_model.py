@@ -146,69 +146,229 @@ class CACTIFModel:
                         "AttentionProcessor requires torch 2.0+. Please upgrade your torch installation."
                     )
 
-            def attention_filtering(self, model_self: CACTIFModel, a_out, a_content, V):
+            def attention_filtering(self, model_self: CACTIFModel, attn_map, V):
                 """
-                Hybrid filtering:
-                • Pixel-wise INSIDE runway region
-                • Token-wise OUTSIDE runway region
-                Grid shape + runway mask alignment FIXED.
-                Shapes (as in original CACTIF):
-                a_out, a_content: [B_variant, N_q, N_k]  (OUT / CONTENT / STYLE)
-                V:                [B_variant, N_q, D]
+                Hybrid selective attention filtering.
+
+                Inside runway:
+                    Pixel-wise filtering.
+                    Each query pixel gets its own CONTENT-vs-STYLE similarity score.
+
+                Outside runway:
+                    Token-wise filtering.
+                    Weak query tokens are replaced according to filter_perc.
+
+                Shapes:
+                    attn_map: [B_variant, H, N_q, N_k]
+                    V:        [B_variant, H, N_k, D]
+
+                Only OUT_INDEX is modified.
                 """
 
-                # 1. Strongest-attended key per query
-                max_idx = a_out.sum(dim=0).argmax(dim=-1)          # [N_q]
+                prc_values = model_self.config.filter_perc
+                runway_prc = model_self.runway_filter_perc
 
-                v_content      = V[CONTENT_INDEX]                  # [N_q, D]
-                v_style        = V[STYLE_INDEX]                    # [N_q, D]
-                v_style_at_max = v_style[:, max_idx]               # [N_q, D]
+                # ------------------------------------------------------------
+                # 1. Number of query pixels/tokens
+                # ------------------------------------------------------------
+                N_q = attn_map.shape[-2]
+                N_k = attn_map.shape[-1]
 
-                # 2. Cosine similarity per query token
-                cos   = F.cosine_similarity(
-                    v_content.float(), v_style_at_max.float(), dim=-1, eps=1e-6
-                )                                                  # [N_q]
-                score = cos.abs()                                  # [N_q]
-                N_q   = score.shape[0]
+                # In the self-attention layers where this filtering is used,
+                # query and key positions correspond to the same spatial grid.
+                if N_q != N_k:
+                    raise RuntimeError(
+                        f"CACTIF attention filtering expects self-attention "
+                        f"with N_q == N_k, got N_q={N_q}, N_k={N_k}"
+                    )
 
-                # 3. Runway mask aligned to non-square token grid
+                # ------------------------------------------------------------
+                # 2. Strongest attended key for every query pixel
+                # ------------------------------------------------------------
+                #
+                # Original behavior:
+                #
+                #   max_map = attn_map[OUT_INDEX].abs().sum(dim=0)
+                #   max_idx = argmax(max_map, dim=-1)
+                #
+                # With head-aware attention:
+                #
+                #   [H, N_q, N_k]
+                #        -> sum heads
+                #   [N_q, N_k]
+                #        -> argmax over keys
+                #   [N_q]
+                #
+                max_map = attn_map[OUT_INDEX].abs().sum(dim=0)
+                max_idx = max_map.argmax(dim=-1)                  # [N_q]
+
+                # ------------------------------------------------------------
+                # 3. CONTENT value at each query pixel
+                #    STYLE value at its strongest-attended key
+                # ------------------------------------------------------------
+                #
+                # V[CONTENT_INDEX]:
+                #   [H, N_k, D]
+                #
+                # V[STYLE_INDEX]:
+                #   [H, N_k, D]
+                #
+                v_content = V[CONTENT_INDEX]
+                v_style = V[STYLE_INDEX]
+
+                # CONTENT feature at the current query/key position.
+                #
+                # [H, N_q, D]
+                v_content_q = v_content[:, :N_q, :]
+
+                # STYLE feature at the strongest-attended key for every
+                # query pixel.
+                #
+                # [H, N_q, D]
+                v_style_max = v_style[:, max_idx, :]
+
+                # ------------------------------------------------------------
+                # 4. Pixel-wise similarity
+                # ------------------------------------------------------------
+                #
+                # Cosine similarity independently for every:
+                #   head × query pixel
+                #
+                # [H, N_q]
+                cos = F.cosine_similarity(
+                    v_content_q.float(),
+                    v_style_max.float(),
+                    dim=-1,
+                    eps=1e-6,
+                )
+
+                # Aggregate heads -> one similarity score per pixel.
+                #
+                # [N_q]
+                score = cos.abs().mean(dim=0)
+
+                # ------------------------------------------------------------
+                # 5. Runway mask at the attention resolution
+                # ------------------------------------------------------------
                 rw = None
+
                 if model_self.runway_mask is not None:
                     H_l, W_l = model_self.runway_mask.shape[-2:]
 
+                    # Find a spatial grid whose number of pixels equals N_q.
+                    #
+                    # Unlike sqrt(N_q) alone, this preserves the original
+                    # non-square latent/image aspect ratio.
                     f = int(round((H_l * W_l / N_q) ** 0.5))
-                    if (H_l // f) * (W_l // f) == N_q:
+
+                    if f > 0 and (H_l // f) * (W_l // f) == N_q:
+                        h = H_l // f
+                        w = W_l // f
+
                         m = F.interpolate(
                             model_self.runway_mask[None],
-                            size=(H_l // f, W_l // f),
-                            mode="area"
-                        )                                           # [1,1,H',W']
-                        rw = (m[0, 0] >= 0.5).flatten()             # [N_q]
+                            size=(h, w),
+                            mode="area",
+                        )
 
-                # 4. Hybrid thresholding: pixel-wise inside runway, token-wise outside
-                prc  = model_self.config.filter_perc
-                rprc = model_self.runway_filter_perc
+                        rw = (m[0, 0] >= 0.5).flatten().to(score.device)
+
+                # ------------------------------------------------------------
+                # 6. Determine weak pixels/tokens
+                # ------------------------------------------------------------
+                #
+                # IMPORTANT:
+                #
+                # Inside runway:
+                #     pixel-wise threshold using runway_filter_perc
+                #
+                # Outside runway:
+                #     token-wise threshold using filter_perc
+                #
+                weak = torch.zeros_like(score, dtype=torch.bool)
 
                 if rw is None:
-                    weak = model_self.weak_below_quantile(score, prc)      # [N_q]
+                    # No runway mask -> original global/token-wise behavior.
+                    weak = model_self.weak_below_quantile(
+                        score,
+                        prc_values,
+                    )
+
                 else:
-                    weak = torch.zeros_like(score, dtype=torch.bool)       # [N_q]
-
+                    # -------------------------
+                    # RUNWAY: pixel-wise
+                    # -------------------------
                     if rw.any():
-                        weak_rw = model_self.weak_below_quantile(score[rw], rprc)
-                        weak[rw] = weak_rw
+                        weak_runway = model_self.weak_below_quantile(
+                            score[rw],
+                            runway_prc,
+                        )
+                        weak[rw] = weak_runway
 
+                    # -------------------------
+                    # NON-RUNWAY: token-wise
+                    # -------------------------
                     if (~rw).any():
-                        weak_non = model_self.weak_below_quantile(score[~rw], prc)
-                        weak[~rw] = weak_non
+                        weak_non_runway = model_self.weak_below_quantile(
+                            score[~rw],
+                            prc_values,
+                        )
+                        weak[~rw] = weak_non_runway
 
-                # 5. Apply filtering
-                a_out = torch.where(weak[None, :, None], a_content, a_out)  # [3, N_q, N_k]
+                # ------------------------------------------------------------
+                # 7. Replace weak attention rows
+                # ------------------------------------------------------------
+                #
+                # A query pixel corresponds to one ROW of the attention map:
+                #
+                #   attn_map[..., query_pixel, key_pixel]
+                #
+                # Therefore the mask belongs on N_q, not N_k.
+                #
+                # [N_q]
+                #   -> [1, 1, N_q, 1]
+                #
+                # This is the critical broadcasting fix for the 2048 vs 80
+                # error encountered previously.
+                attn_mask = weak[None, None, :, None]
 
-                v_out = V[OUT_INDEX]                                        # [N_q, D]
-                v_out = torch.where(weak[:, None], v_content, v_out)        # [N_q, D]
+                attn_map_filtered = torch.where(
+                    attn_mask,
+                    attn_map[CONTENT_INDEX:CONTENT_INDEX + 1],
+                    attn_map[OUT_INDEX:OUT_INDEX + 1],
+                )
 
-                return a_out, v_out
+                # Put the filtered OUT branch back into the complete tensor.
+                attn_map_out = attn_map.clone()
+                attn_map_out[OUT_INDEX] = attn_map_filtered[0]
+
+                # ------------------------------------------------------------
+                # 8. Replace corresponding OUT value positions
+                # ------------------------------------------------------------
+                #
+                # V has:
+                #
+                #   [B_variant, H, N_k, D]
+                #
+                # Since this is self-attention, query and key positions are
+                # spatially aligned. Therefore the weak-pixel mask applies to
+                # the N_k dimension here.
+                #
+                # [N_q]
+                #   -> [1, N_q, 1]
+                #
+                value_mask = weak[None, :, None]
+
+                V_out = torch.where(
+                    value_mask,
+                    v_content,
+                    V[OUT_INDEX],
+                )
+
+                V_filtered = V.clone()
+                V_filtered[OUT_INDEX] = V_out
+
+                return attn_map_out, V_filtered
 
 
 
