@@ -193,11 +193,12 @@ class CACTIFModel:
                 # 3. CONTENT value at each query pixel
                 #    STYLE value at its strongest-attended key
                 # ------------------------------------------------------------
-                v_content = V[CONTENT_INDEX]
-                v_style = V[STYLE_INDEX]
+                v_content = V[CONTENT_INDEX]      # [N_q, D]
+                v_style   = V[STYLE_INDEX]        # [N_q, D]
 
-                v_content_q = v_content[:, :N_q, :]
-                v_style_max = v_style[:, max_idx, :]
+                v_content_q = v_content           # [N_q, D]
+                v_style_max = v_style[max_idx]    # [N_q, D]
+
 
                 # ------------------------------------------------------------
                 # 4. Pixel-wise similarity
