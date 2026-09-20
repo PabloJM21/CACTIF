@@ -157,26 +157,21 @@ class CACTIFModel:
                 V:                [B_variant, N_q, D]
                 """
 
-                # ------------------------------------------------------------
                 # 1. Strongest-attended key per query
-                # ------------------------------------------------------------
                 max_idx = a_out.sum(dim=0).argmax(dim=-1)          # [N_q]
 
-                v_content     = V[CONTENT_INDEX]                   # [N_q, D]
-                v_style       = V[STYLE_INDEX]                     # [N_q, D]
+                v_content      = V[CONTENT_INDEX]                  # [N_q, D]
+                v_style        = V[STYLE_INDEX]                    # [N_q, D]
                 v_style_at_max = v_style[:, max_idx]               # [N_q, D]
 
-                # ------------------------------------------------------------
                 # 2. Cosine similarity per query token
-                # ------------------------------------------------------------
-                cos = F.cosine_similarity(
+                cos   = F.cosine_similarity(
                     v_content.float(), v_style_at_max.float(), dim=-1, eps=1e-6
                 )                                                  # [N_q]
                 score = cos.abs()                                  # [N_q]
+                N_q   = score.shape[0]
 
-                # ------------------------------------------------------------
                 # 3. Runway mask aligned to non-square token grid
-                # ------------------------------------------------------------
                 rw = None
                 if model_self.runway_mask is not None:
                     H_l, W_l = model_self.runway_mask.shape[-2:]
@@ -190,16 +185,14 @@ class CACTIFModel:
                         )                                           # [1,1,H',W']
                         rw = (m[0, 0] >= 0.5).flatten()             # [N_q]
 
-                # ------------------------------------------------------------
-                # 4. Hybrid thresholding
-                # ------------------------------------------------------------
+                # 4. Hybrid thresholding: pixel-wise inside runway, token-wise outside
                 prc  = model_self.config.filter_perc
                 rprc = model_self.runway_filter_perc
 
                 if rw is None:
-                    weak = model_self.weak_below_quantile(score, prc)
+                    weak = model_self.weak_below_quantile(score, prc)      # [N_q]
                 else:
-                    weak = torch.zeros_like(score, dtype=torch.bool)
+                    weak = torch.zeros_like(score, dtype=torch.bool)       # [N_q]
 
                     if rw.any():
                         weak_rw = model_self.weak_below_quantile(score[rw], rprc)
@@ -209,15 +202,14 @@ class CACTIFModel:
                         weak_non = model_self.weak_below_quantile(score[~rw], prc)
                         weak[~rw] = weak_non
 
-                # ------------------------------------------------------------
                 # 5. Apply filtering
-                # ------------------------------------------------------------
-                a_out = torch.where(weak[None, :, None], a_content, a_out)      # [3, N_q, N_k]
+                a_out = torch.where(weak[None, :, None], a_content, a_out)  # [3, N_q, N_k]
 
-                v_out = V[OUT_INDEX]                                            # [N_q, D]
-                v_out = torch.where(weak[:, None], v_content, v_out)            # [N_q, D]
+                v_out = V[OUT_INDEX]                                        # [N_q, D]
+                v_out = torch.where(weak[:, None], v_content, v_out)        # [N_q, D]
 
                 return a_out, v_out
+
 
 
 
