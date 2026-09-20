@@ -11,7 +11,7 @@ from models.stable_diffusion import CrossImageAttentionStableDiffusionPipeline
 from utils import attention_utils
 from utils.adain import adain, custom_adain_pixel
 from utils.model_utils import get_stable_diffusion_model
-
+import cv2
 
 class CACTIFModel:
     """
@@ -37,6 +37,11 @@ class CACTIFModel:
 
         self.enable_edit = False
         self.step = 0
+
+        self.runway_mask = None            # [1, h, w] float in [0, 1], latent resolution
+        self.runway_filter_perc = 0.5
+        self.runway_adain_perc = 0.5
+        self._runway_token_cache = {}
 
     def set_onehot_masks(self):
         """
@@ -67,6 +72,42 @@ class CACTIFModel:
         self.zs_style = zs_style
         self.zs_content = zs_content
 
+
+    def set_runway_mask(self, mask_np, latent_hw=None, device=None, feather_sigma: float = 1.0):
+        """mask_np: (H, W) float32 in {0,1} (already cropped like the content image), or None."""
+        self._runway_token_cache = {}
+        if mask_np is None:
+            self.runway_mask = None
+            return
+        lat_h, lat_w = latent_hw
+        m = cv2.resize(mask_np, (int(lat_w), int(lat_h)), interpolation=cv2.INTER_AREA)
+        if feather_sigma > 0:
+            m = cv2.GaussianBlur(m, (0, 0), feather_sigma)
+        self.runway_mask = torch.from_numpy(m).float().unsqueeze(0).to(device)
+
+    def get_runway_tokens(self, n_tokens: int, device):
+        """Boolean [N] runway-token mask for a layer with N tokens, or None."""
+        if self.runway_mask is None:
+            return None
+        if n_tokens not in self._runway_token_cache:
+            side = int(round(n_tokens ** 0.5))
+            if side * side != n_tokens:
+                self._runway_token_cache[n_tokens] = None
+            else:
+                m = F.interpolate(self.runway_mask[None], size=(side, side), mode="area")
+                self._runway_token_cache[n_tokens] = (m[0, 0] >= 0.5).flatten()
+        tok = self._runway_token_cache[n_tokens]
+        return None if tok is None else tok.to(device)
+
+    @staticmethod
+    def weak_below_quantile(score: torch.Tensor, q: float) -> torch.Tensor:
+        """Bool mask of tokens whose score is below the q-quantile (q=0 -> none, q>=1 -> all)."""
+        if q <= 0.0:
+            return torch.zeros_like(score, dtype=torch.bool)
+        if q >= 1.0:
+            return torch.ones_like(score, dtype=torch.bool)
+        return score < torch.quantile(score, q)
+
     def get_adain_callback(self) -> Callable:
         """
         Returns a callback function for AdaIN or class-AdaIN based on the current step and config.
@@ -78,8 +119,13 @@ class CACTIFModel:
                 # Apply class-wise AdaIN
                 latents[0] = custom_adain_pixel(latents[0], latents[1], self.label_content_adain, self.label_style_adain)
             else:
-                # Apply standard AdaIN
-                latents[0] = adain(latents[0], latents[1])
+                adained = adain(latents[0], latents[1])
+                if self.runway_mask is not None:
+                    # AdaIN weight per pixel: 1 outside the runway, runway_adain_perc inside
+                    w = 1.0 + (self.runway_adain_perc - 1.0) * self.runway_mask.to(adained.dtype)
+                    latents[0] = w * adained + (1.0 - w) * latents[0]
+                else:
+                    latents[0] = adained
         
         return callback
 
@@ -100,17 +146,28 @@ class CACTIFModel:
                     )
 
             def attention_filtering(self, model_self, a_out, a_content, V):
-                prc = model_self.config.filter_perc
-
-                max_idx = a_out.sum(dim=0).argmax(dim=-1)                      # [N]; abs() was a no-op (weights >= 0)
-                v_content = V[CONTENT_INDEX]                                    # [H,N,D]
-                v_style_at_max = V[STYLE_INDEX][:, max_idx]                     # [H,N,D]
+                max_idx = a_out.sum(dim=0).argmax(dim=-1)
+                v_content = V[CONTENT_INDEX]
+                v_style_at_max = V[STYLE_INDEX][:, max_idx]
 
                 cos = F.cosine_similarity(v_content.float(), v_style_at_max.float(), dim=-1, eps=1e-6)
                 score = cos.abs().sum(dim=0)                                    # [N]
-                weak = score < torch.quantile(score, prc)                       # [N] bool, stays on GPU
 
-                a_out = torch.where(weak, a_content, a_out)                     # mask over key dim
+                rw = model_self.get_runway_tokens(score.shape[0], score.device)
+                prc = model_self.config.filter_perc
+                rprc = model_self.runway_filter_perc
+
+                if rw is None or not rw.any():
+                    weak = model_self.weak_below_quantile(score, prc)
+                elif rw.all():
+                    weak = model_self.weak_below_quantile(score, rprc)
+                else:
+                    # each region gets its own quantile, computed only over its own tokens
+                    weak = torch.zeros_like(rw)
+                    weak[rw] = model_self.weak_below_quantile(score[rw], rprc)
+                    weak[~rw] = model_self.weak_below_quantile(score[~rw], prc)
+
+                a_out = torch.where(weak, a_content, a_out)
                 v_out = torch.where(weak[:, None], v_content, V[OUT_INDEX])
                 return a_out, v_out
 

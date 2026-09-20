@@ -13,6 +13,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from cactif_model import CACTIFModel
 from config import Range, RunConfig
 from utils.latent_utils import get_init_latents_and_noises, load_or_invert_one_image
+import os
+import cv2
+import numpy as np
+from PIL import Image
 
 
 def parse_bool(value: str) -> bool:
@@ -156,6 +160,31 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--use_masks",
+        type=parse_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Build a runway mask from the .txt annotation next to each content image "
+             "and apply runway-specific AdaIN / attention filtering.",
+    )
+
+    parser.add_argument(
+        "--runway_filter_perc",
+        type=float,
+        default=0.5,
+        help="Only with --use_masks. Fraction of weakest-similarity tokens inside the runway "
+             "that fall back to content attention (independent of --filter_perc).",
+    )
+
+    parser.add_argument(
+        "--runway_adain_perc",
+        type=float,
+        default=0.5,
+        help="Only with --use_masks. AdaIN strength inside the runway: 1 = full AdaIN, 0 = none.",
+    )
+
     args = parser.parse_args()
 
     if args.steps <= 0:
@@ -173,7 +202,82 @@ def parse_args() -> argparse.Namespace:
     if args.style_dir is not None and not args.style_dir.is_dir():
         parser.error(f"Style directory does not exist: {args.style_dir}")
 
+    if not 0.0 <= args.runway_filter_perc <= 1.0:
+        parser.error("--runway_filter_perc must be in [0, 1].")
+
+    if not 0.0 <= args.runway_adain_perc <= 1.0:
+        parser.error("--runway_adain_perc must be in [0, 1].")
+
     return args
+
+
+
+def load_gt_points_from_txt(img_path, w, h):
+    """Read a polygon annotation (last 8 values = normalized corner coords)."""
+    txt_path = os.path.splitext(img_path)[0] + ".txt"
+
+    if not os.path.exists(txt_path):
+        return None
+
+    with open(txt_path, "r", encoding="utf-8") as f:
+        line = f.readline().strip()
+
+    if not line:
+        return None
+
+    values = line.split()
+    if len(values) < 13:
+        return None
+
+    coords = list(map(float, values[-8:]))
+
+    x_tl, y_tl, x_bl, y_bl, x_tr, y_tr, x_br, y_br = coords
+
+    gt_pts = np.array(
+        [
+            [x_tl * w, y_tl * h],
+            [x_tr * w, y_tr * h],
+            [x_br * w, y_br * h],
+            [x_bl * w, y_bl * h],
+        ],
+        dtype=np.int32,
+    ).reshape(-1, 1, 2)
+
+    return gt_pts
+
+def load_gt_mask(img_path, w, h):
+    """Build a binary runway mask (H, W) float32 in {0, 1} from the GT polygon.
+
+    Returns None if no companion .txt annotation exists for this image, so
+    callers can fall back to skipping the runway re-integration step.
+    """
+    gt_pts = load_gt_points_from_txt(img_path, w, h)
+    if gt_pts is None:
+        return None
+
+    gt_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(gt_mask, [gt_pts], 255)
+
+    return (gt_mask > 0).astype(np.float32)
+
+
+
+def build_runway_mask(content_img: Path, crop_square: bool = True):
+    """Runway mask at original-image resolution, center-cropped like image_utils.load_size."""
+    with Image.open(content_img) as im:
+        w, h = im.size
+    mask = load_gt_mask(str(content_img), w, h)
+    if mask is None:
+        return None
+    if crop_square:
+        if h < w:
+            off = (w - h) // 2
+            mask = mask[:, off:off + h]
+        elif w < h:
+            off = (h - w) // 2
+            mask = mask[off:off + w, :]
+    return mask
+
 
 
 def collect_content_images(content_dir: Path, image_format: str):
@@ -209,6 +313,7 @@ def run_style_transfer(
     content_img: Path,
     style_img: Path,
     output_path: Path,
+    use_masks: bool = False,
 ) -> None:
     with torch.inference_mode():
         cfg.update_latents_path(content_img.stem, style_img.stem)
@@ -217,6 +322,16 @@ def run_style_transfer(
 
         model.set_latents(latents_style, latents_content)
         model.set_noise(noise_style, noise_content)
+
+        # Runway mask (content image only). Always reset so a mask never leaks between images.
+        model.set_runway_mask(None)  # always reset so a mask never leaks between images
+        if use_masks:
+            mask = build_runway_mask(content_img, crop_square=True)
+            if mask is None:
+                print(f"  Warning: no usable .txt annotation for {content_img.name}; running without mask.")
+            else:
+                ref = latents_content[0] if isinstance(latents_content, (list, tuple)) else latents_content
+                model.set_runway_mask(mask, latent_hw=ref.shape[-2:], device=ref.device)
 
         init_latents, init_zs = get_init_latents_and_noises(model=model, cfg=cfg)
         start_step = min(cfg.cross_attn_32_range.start, cfg.cross_attn_64_range.start)
@@ -281,6 +396,10 @@ def main() -> None:
 
     set_seed(cfg.seed)
     model = CACTIFModel(cfg)
+    model.runway_filter_perc = args.runway_filter_perc
+    model.runway_adain_perc = args.runway_adain_perc
+
+    
     model.pipe.scheduler.set_timesteps(cfg.num_timesteps)
 
     if style_files is not None:
