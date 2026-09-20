@@ -458,6 +458,7 @@ def main() -> None:
             content_img=input_path,
             style_img=style_path,
             output_path=output_path,
+            use_masks=args.use_masks
         )
 
     print(f"Finished. Wrote {len(input_files)} file(s) to {output_dir}")
