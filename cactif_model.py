@@ -149,13 +149,25 @@ class CACTIFModel:
             def attention_filtering(self, model_self: CACTIFModel, a_out, a_content, V):
                 """
                 Hybrid filtering:
-                • Pixel-wise (original) INSIDE runway region
+                • Pixel-wise INSIDE runway region
                 • Token-wise OUTSIDE runway region
                 Grid shape + runway mask alignment FIXED.
                 Supports both shapes:
                     UNet:        [heads, N_q, N_k]
                     Transformer: [B, heads, N_q, N_k]
                 """
+
+                def collapse_heads_if_needed(v_content, v_style):
+                    """
+                    v_content, v_style may be:
+                    [B, heads, N_q, D]  or  [B, N_q, D]
+                    We collapse heads to get [B, N_q, D] when needed.
+                    """
+                    if v_content.dim() == 4:
+                        B, H, N_q, D = v_content.shape
+                        v_content = v_content.mean(dim=1)  # [B, N_q, D]
+                        v_style   = v_style.mean(dim=1)    # [B, N_q, D]
+                    return v_content, v_style
 
                 # ------------------------------------------------------------
                 # 0. Normalize shapes (add batch dim if missing)
@@ -172,7 +184,6 @@ class CACTIFModel:
                         added_batch = True
 
                     # Convert UNet format into dict format expected by hybrid logic
-                    # UNet only has OUT_INDEX; CONTENT_INDEX and STYLE_INDEX are identical
                     V = {
                         OUT_INDEX: V,                     # [B, heads, N_q, D]
                         CONTENT_INDEX: V.clone(),
@@ -181,14 +192,12 @@ class CACTIFModel:
 
                 # Case B: Transformer attention → V is already a dict
                 else:
-                    # a_out: [B, heads, N_q, N_k] → nothing to do
                     pass
-
 
                 B, H, N_q, N_k = a_out.shape
 
                 # ------------------------------------------------------------
-                # 1. Compute strongest-attended key per query (original logic)
+                # 1. Compute strongest-attended key per query
                 # ------------------------------------------------------------
                 a_out_out = a_out[OUT_INDEX]                 # [B, heads, N_q, N_k]
                 max_map = a_out_out.abs().sum(dim=1)         # [B, N_q, N_k]
@@ -197,12 +206,13 @@ class CACTIFModel:
                 # ------------------------------------------------------------
                 # 2. Gather content/style value vectors
                 # ------------------------------------------------------------
-                v_content = V[CONTENT_INDEX]                 # [B, N_q, D]
-                v_style   = V[STYLE_INDEX]                   # [B, N_q, D]
+                v_content = V[CONTENT_INDEX]                 # [B, heads, N_q, D] or [B, N_q, D]
+                v_style   = V[STYLE_INDEX]                   # same shape
 
+                v_content, v_style = collapse_heads_if_needed(v_content, v_style)
                 B, N_q, D = v_content.shape
 
-                idx_expanded = max_idx.unsqueeze(-1).expand(B, N_q, D)
+                idx_expanded   = max_idx.unsqueeze(-1).expand(B, N_q, D)
                 v_style_at_max = torch.gather(v_style, 1, idx_expanded)  # [B, N_q, D]
 
                 # ------------------------------------------------------------
@@ -244,16 +254,15 @@ class CACTIFModel:
                     # No runway → pure token-wise (for speed)
                     weak = model_self.weak_below_quantile(score, prc)
                 else:
-                    # Flatten for quantile ops
                     score_flat = score.reshape(-1)
                     rw_flat    = rw.reshape(-1)
 
-                    # Pixel-wise inside runway (original)
+                    # Pixel-wise inside runway
                     if rw_flat.any():
                         weak_rw = model_self.weak_below_quantile(score_flat[rw_flat], rprc)
                         weak[rw] = weak_rw.reshape(-1)
 
-                    # Token-wise outside runway (for speed)
+                    # Token-wise outside runway
                     if (~rw_flat).any():
                         weak_non = model_self.weak_below_quantile(score_flat[~rw_flat], prc)
                         weak[~rw] = weak_non.reshape(-1)
@@ -269,15 +278,22 @@ class CACTIFModel:
 
                 a_out_filtered = torch.where(weak_attn, a_content_out, a_out_out)
 
-                v_out      = V[OUT_INDEX]                     # [B,N_q,D]
-                v_content  = V[CONTENT_INDEX]                 # [B,N_q,D]
-                weak_v     = weak.unsqueeze(-1).expand_as(v_out)
+                v_out      = V[OUT_INDEX]                     # [B, heads, N_q, D] or [B, N_q, D]
+                v_content  = V[CONTENT_INDEX]                 # same shape
 
+                # collapse heads for values if needed, then apply weak_v
+                if v_out.dim() == 4:
+                    # [B, heads, N_q, D] → collapse heads after filtering
+                    v_out      = v_out.mean(dim=1)            # [B, N_q, D]
+                    v_content  = v_content.mean(dim=1)        # [B, N_q, D]
+
+                weak_v     = weak.unsqueeze(-1).expand_as(v_out)
                 v_out_filtered = torch.where(weak_v, v_content, v_out)
 
                 # write back
+                # if we collapsed heads, we only have [B, N_q, D] for OUT_INDEX
+                V[OUT_INDEX] = v_out_filtered
                 a_out[OUT_INDEX] = a_out_filtered
-                V[OUT_INDEX]     = v_out_filtered
 
                 # ------------------------------------------------------------
                 # 7. Remove artificial batch dim if we added one
@@ -287,6 +303,7 @@ class CACTIFModel:
                     V = {k: v.squeeze(0) for k, v in V.items()}
 
                 return a_out, V
+
 
 
 
