@@ -158,11 +158,7 @@ class CACTIFModel:
                 """
 
                 def collapse_heads_if_needed(v_content, v_style):
-                    """
-                    v_content, v_style may be:
-                    [B, heads, N_q, D]  or  [B, N_q, D]
-                    We collapse heads to get [B, N_q, D] when needed.
-                    """
+                    # v_content, v_style: [B, heads, N_q, D] or [B, N_q, D]
                     if v_content.dim() == 4:
                         B, H, N_q, D = v_content.shape
                         v_content = v_content.mean(dim=1)  # [B, N_q, D]
@@ -203,17 +199,21 @@ class CACTIFModel:
                 max_map = a_out_out.abs().sum(dim=1)         # [B, N_q, N_k]
                 max_idx = max_map.argmax(dim=-1)             # [B, N_q]
 
-                # ------------------------------------------------------------
                 # 2. Gather content/style value vectors
-                # ------------------------------------------------------------
                 v_content = V[CONTENT_INDEX]                 # [B, heads, N_q, D] or [B, N_q, D]
-                v_style   = V[STYLE_INDEX]                   # same shape
+                v_style   = V[STYLE_INDEX]                   # same
 
+                # collapse heads BEFORE unpacking
                 v_content, v_style = collapse_heads_if_needed(v_content, v_style)
-                B, N_q, D = v_content.shape
+                B, N_q, D = v_content.shape                  # now always 3D
 
                 idx_expanded   = max_idx.unsqueeze(-1).expand(B, N_q, D)
                 v_style_at_max = torch.gather(v_style, 1, idx_expanded)  # [B, N_q, D]
+
+                cos = F.cosine_similarity(
+                    v_content.float(), v_style_at_max.float(), dim=-1, eps=1e-6
+                )
+                score = cos.abs()
 
                 # ------------------------------------------------------------
                 # 3. Cosine similarity per query token
