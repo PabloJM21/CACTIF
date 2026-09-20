@@ -13,6 +13,7 @@ from utils.adain import adain, custom_adain_pixel
 from utils.model_utils import get_stable_diffusion_model
 import cv2
 
+
 class CACTIFModel:
     """
     CACTIFModel handles class-wise AdaIN during generation and a
@@ -38,6 +39,7 @@ class CACTIFModel:
         self.enable_edit = False
         self.step = 0
 
+        # Runway-related
         self.runway_mask = None            # [1, h, w] float in [0, 1], latent resolution
         self.runway_filter_perc = 0.5
         self.runway_adain_perc = 0.5
@@ -71,7 +73,6 @@ class CACTIFModel:
     def set_noise(self, zs_style: torch.Tensor, zs_content: torch.Tensor):
         self.zs_style = zs_style
         self.zs_content = zs_content
-
 
     def set_runway_mask(self, mask_np, latent_hw=None, device=None, feather_sigma: float = 1.0):
         """mask_np: (H, W) float32 in {0,1} (already cropped like the content image), or None."""
@@ -122,12 +123,11 @@ class CACTIFModel:
                 adained = adain(latents[0], latents[1])
                 if self.runway_mask is not None:
                     # AdaIN weight per pixel: 1 outside the runway, runway_adain_perc inside
-                    print("AdaIN weight per pixel: 1 outside the runway, runway_adain_perc inside")
                     w = 1.0 + (self.runway_adain_perc - 1.0) * self.runway_mask.to(adained.dtype)
                     latents[0] = w * adained + (1.0 - w) * latents[0]
                 else:
                     latents[0] = adained
-        
+
         return callback
 
     def register_attention_control(self):
@@ -146,31 +146,91 @@ class CACTIFModel:
                         "AttentionProcessor requires torch 2.0+. Please upgrade your torch installation."
                     )
 
-            def attention_filtering(self, model_self, a_out, a_content, V):
-                max_idx = a_out.sum(dim=0).argmax(dim=-1)
-                v_content = V[CONTENT_INDEX]
-                v_style_at_max = V[STYLE_INDEX][:, max_idx]
+            def attention_filtering(self, model_self: CACTIFModel, a_out, a_content, V):
+                """
+                Pixel-wise granularity (Class B-style) exported into Class A,
+                with runway-aware quantiles and correct non-square grid alignment.
+                a_out, a_content: [B, heads, N_q, N_k]
+                V: [B_variant, N_q, head_dim] (STYLE/CONTENT/OUT indices)
+                """
 
-                cos = F.cosine_similarity(v_content.float(), v_style_at_max.float(), dim=-1, eps=1e-6)
-                score = cos.abs().sum(dim=0)                                    # [N]
+                # --- Compute per-query max-attended key index (Class B logic) ---
+                a_out_out = a_out[OUT_INDEX]                 # [B, heads, N_q, N_k]
+                max_map = a_out_out.abs().sum(dim=1)         # [B, N_q, N_k]
+                max_idx = max_map.argmax(dim=-1)             # [B, N_q]
 
-                rw = model_self.get_runway_tokens(score.shape[0], score.device)
+                # --- Gather content and style value vectors ---
+                v_content = V[CONTENT_INDEX]                 # [B, N_q, D]
+                bsz, n_q, dim_v = v_content.shape
+
+                v_style = V[STYLE_INDEX]                     # [B, N_q, D]
+                idx_expanded = max_idx.unsqueeze(-1).expand(bsz, n_q, dim_v)
+                v_style_at_max = torch.gather(v_style, 1, idx_expanded)  # [B, N_q, D]
+
+                # --- Cosine similarity per query token ---
+                cos = F.cosine_similarity(
+                    v_content.float(), v_style_at_max.float(), dim=-1, eps=1e-6
+                )                                            # [B, N_q]
+                score = cos.abs()                            # [B, N_q]
+                score_flat = score.reshape(-1)               # [B*N_q]
+
+                # ------------------------------------------------------------------
+                # FIXED: runway mask aligned to *true* non-square token grid
+                # ------------------------------------------------------------------
+                rw = None
+                if model_self.runway_mask is not None:
+                    H_l, W_l = model_self.runway_mask.shape[-2:]   # latent resolution (e.g., 64×128)
+
+                    # Find integer downsampling factor f such that:
+                    #   (H_l/f) * (W_l/f) == N_q
+                    f = int(round((H_l * W_l / n_q) ** 0.5))
+
+                    if (H_l // f) * (W_l // f) == n_q:
+                        # interpolate runway mask to token grid resolution
+                        m = F.interpolate(
+                            model_self.runway_mask[None],
+                            size=(H_l // f, W_l // f),
+                            mode="area"
+                        )                                       # [1,1,H',W']
+                        rw = (m[0, 0] >= 0.5).flatten()          # [N_q]
+                        rw = rw.unsqueeze(0).expand(bsz, n_q)    # [B,N_q]
+                        rw = rw.reshape(-1)                      # [B*N_q]
+
                 prc = model_self.config.filter_perc
                 rprc = model_self.runway_filter_perc
 
+                # --- Region-specific quantile thresholding (unchanged) ---
                 if rw is None or not rw.any():
-                    weak = model_self.weak_below_quantile(score, prc)
+                    weak_flat = model_self.weak_below_quantile(score_flat, prc)
                 elif rw.all():
-                    weak = model_self.weak_below_quantile(score, rprc)
+                    weak_flat = model_self.weak_below_quantile(score_flat, rprc)
                 else:
-                    # each region gets its own quantile, computed only over its own tokens
-                    weak = torch.zeros_like(rw)
-                    weak[rw] = model_self.weak_below_quantile(score[rw], rprc)
-                    weak[~rw] = model_self.weak_below_quantile(score[~rw], prc)
+                    weak_flat = torch.zeros_like(rw, dtype=torch.bool)
+                    weak_flat[rw] = model_self.weak_below_quantile(score_flat[rw], rprc)
+                    weak_flat[~rw] = model_self.weak_below_quantile(score_flat[~rw], prc)
 
-                a_out = torch.where(weak, a_content, a_out)
-                v_out = torch.where(weak[:, None], v_content, V[OUT_INDEX])
-                return a_out, v_out
+                weak = weak_flat.view(bsz, n_q)                # [B, N_q]
+
+                # --- Apply filtering (unchanged) ---
+                a_out_out = a_out[OUT_INDEX]                   # [B, heads, N_q, N_k]
+                a_content_out = a_content[CONTENT_INDEX]       # [B, heads, N_q, N_k]
+
+                weak_attn = weak.unsqueeze(1).unsqueeze(-1)    # [B,1,N_q,1]
+                weak_attn = weak_attn.expand_as(a_out_out)     # [B,heads,N_q,N_k]
+
+                a_out_filtered = torch.where(weak_attn, a_content_out, a_out_out)
+
+                v_out = V[OUT_INDEX]                           # [B,N_q,D]
+                v_content = V[CONTENT_INDEX]                   # [B,N_q,D]
+                weak_v = weak.unsqueeze(-1).expand_as(v_out)   # [B,N_q,D]
+                v_out_filtered = torch.where(weak_v, v_content, v_out)
+
+                # write back
+                a_out[OUT_INDEX] = a_out_filtered
+                V[OUT_INDEX] = v_out_filtered
+
+                return a_out, V
+
 
             def __call__(self,
                          attn,
@@ -179,14 +239,14 @@ class CACTIFModel:
                          attention_mask=None,
                          temb=None,
                          perform_swap: bool = False):
-                
+
                 residual = hidden_states
 
                 if attn.spatial_norm is not None:
                     hidden_states = attn.spatial_norm(hidden_states, temb)
 
                 input_ndim = hidden_states.ndim
-                
+
                 if input_ndim == 4:
                     batch_size, channel, height, width = hidden_states.shape
                     hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
@@ -202,11 +262,10 @@ class CACTIFModel:
                 if attn.group_norm is not None:
                     hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-                    
                 is_cross = encoder_hidden_states is not None
-                
+
                 query = attn.to_q(hidden_states)
-                
+
                 if not is_cross:
                     encoder_hidden_states = hidden_states
                 elif attn.norm_cross:
@@ -214,11 +273,11 @@ class CACTIFModel:
 
                 key = attn.to_k(encoder_hidden_states)
                 value = attn.to_v(encoder_hidden_states)
-                
+
                 inner_dim = key.shape[-1]
                 head_dim = inner_dim // attn.heads
                 should_mix = False
-                
+
                 # Potentially apply cross image attention operation
                 # To do so, we need to be in a self-attention layer in the decoder part of the denoising network
                 if model_self.config.cross_attention:
@@ -232,7 +291,7 @@ class CACTIFModel:
                 query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
                 key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
                 value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-                
+
                 do_edit = perform_swap and model_self.enable_edit and should_mix and not is_cross
                 use_filter = do_edit and model_self.config.filtering
 
@@ -246,9 +305,9 @@ class CACTIFModel:
 
                 if use_filter:
                     a_out, v_out = self.attention_filtering(model_self, *maps, value)
-                    hidden_states[OUT_INDEX] = a_out @ v_out      # only the OUT element changes
-                
-                      
+                    # Only OUT_INDEX branch changes
+                    hidden_states[OUT_INDEX] = a_out[OUT_INDEX] @ v_out[OUT_INDEX]
+
                 hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
                 hidden_states = hidden_states.to(query[OUT_INDEX].dtype)
 
@@ -264,7 +323,7 @@ class CACTIFModel:
                     hidden_states = hidden_states + residual
 
                 hidden_states = hidden_states / attn.rescale_output_factor
-                
+
                 return hidden_states
 
         def register_recr(net_, count, place_in_unet):
