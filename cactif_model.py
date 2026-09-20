@@ -122,6 +122,7 @@ class CACTIFModel:
                 adained = adain(latents[0], latents[1])
                 if self.runway_mask is not None:
                     # AdaIN weight per pixel: 1 outside the runway, runway_adain_perc inside
+                    print("AdaIN weight per pixel: 1 outside the runway, runway_adain_perc inside")
                     w = 1.0 + (self.runway_adain_perc - 1.0) * self.runway_mask.to(adained.dtype)
                     latents[0] = w * adained + (1.0 - w) * latents[0]
                 else:

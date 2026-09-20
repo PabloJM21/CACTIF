@@ -330,6 +330,7 @@ def run_style_transfer(
             if mask is None:
                 print(f"  Warning: no usable .txt annotation for {content_img.name}; running without mask.")
             else:
+                print(f"Running with mask")
                 ref = latents_content[0] if isinstance(latents_content, (list, tuple)) else latents_content
                 model.set_runway_mask(mask, latent_hw=ref.shape[-2:], device=ref.device)
 
