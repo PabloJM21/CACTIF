@@ -160,14 +160,30 @@ class CACTIFModel:
                 # ------------------------------------------------------------
                 # 0. Normalize shapes (add batch dim if missing)
                 # ------------------------------------------------------------
-                if a_out.dim() == 3:
-                    # UNet attention: [heads, N_q, N_k]
-                    a_out = a_out.unsqueeze(0)        # [1, heads, N_q, N_k]
-                    a_content = a_content.unsqueeze(0)
-                    V = {k: v.unsqueeze(0) for k, v in V.items()}
-                    added_batch = True
+                added_batch = False
+
+                # Case A: UNet attention → V is a Tensor
+                if isinstance(V, torch.Tensor):
+                    # a_out: [heads, N_q, N_k] → add batch dim
+                    if a_out.dim() == 3:
+                        a_out = a_out.unsqueeze(0)        # [1, heads, N_q, N_k]
+                        a_content = a_content.unsqueeze(0)
+                        V = V.unsqueeze(0)                # [1, heads, N_q, D]
+                        added_batch = True
+
+                    # Convert UNet format into dict format expected by hybrid logic
+                    # UNet only has OUT_INDEX; CONTENT_INDEX and STYLE_INDEX are identical
+                    V = {
+                        OUT_INDEX: V,                     # [B, heads, N_q, D]
+                        CONTENT_INDEX: V.clone(),
+                        STYLE_INDEX: V.clone(),
+                    }
+
+                # Case B: Transformer attention → V is already a dict
                 else:
-                    added_batch = False
+                    # a_out: [B, heads, N_q, N_k] → nothing to do
+                    pass
+
 
                 B, H, N_q, N_k = a_out.shape
 
