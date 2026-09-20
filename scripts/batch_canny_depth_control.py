@@ -279,6 +279,27 @@ def build_runway_mask(content_img: Path, crop_square: bool = True):
     return mask
 
 
+from utils import image_utils
+
+
+def save_mask_overlay(content_img: Path, mask: np.ndarray, out_path: Path, alpha: float = 0.4) -> None:
+    """Save the runway mask drawn over the image exactly as the model sees it (via load_size)."""
+    image = np.array(image_utils.load_size(content_img)).astype(np.float32)   # [H, W, 3]
+    h, w = image.shape[:2]
+
+    m = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST) > 0.5
+    red = np.array([255.0, 0.0, 0.0], dtype=np.float32)
+
+    overlay = image.copy()
+    overlay[m] = (1.0 - alpha) * overlay[m] + alpha * red
+    overlay = overlay.clip(0, 255).astype(np.uint8)
+
+    # Outline makes small misalignments easier to spot
+    contours, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (255, 255, 0), 1)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(overlay).save(out_path)
 
 def collect_content_images(content_dir: Path, image_format: str):
     input_files = sorted(
@@ -333,6 +354,10 @@ def run_style_transfer(
                 print(f"Running with mask")
                 ref = latents_content[0] if isinstance(latents_content, (list, tuple)) else latents_content
                 model.set_runway_mask(mask, latent_hw=ref.shape[-2:], device=ref.device)
+
+                overlay_path = output_path.parent / "mask_overlays" / f"{content_img.stem}.png"
+                save_mask_overlay(content_img, mask, overlay_path)
+                print(f"  Saved mask overlay: {overlay_path}")
 
         init_latents, init_zs = get_init_latents_and_noises(model=model, cfg=cfg)
         start_step = min(cfg.cross_attn_32_range.start, cfg.cross_attn_64_range.start)
