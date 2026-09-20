@@ -146,7 +146,7 @@ class CACTIFModel:
                         "AttentionProcessor requires torch 2.0+. Please upgrade your torch installation."
                     )
 
-            def attention_filtering(self, model_self: CACTIFModel, attn_map, V):
+            def attention_filtering(self, model_self: CACTIFModel, a_out, a_content, V):
                 """
                 Hybrid selective attention filtering.
 
@@ -159,8 +159,9 @@ class CACTIFModel:
                     Weak query tokens are replaced according to filter_perc.
 
                 Shapes:
-                    attn_map: [B_variant, H, N_q, N_k]
-                    V:        [B_variant, H, N_k, D]
+                    a_out:     [B_variant, H, N_q, N_k]
+                    a_content: [B_variant, H, N_q, N_k]
+                    V:         [B_variant, H, N_k, D]
 
                 Only OUT_INDEX is modified.
                 """
@@ -171,8 +172,8 @@ class CACTIFModel:
                 # ------------------------------------------------------------
                 # 1. Number of query pixels/tokens
                 # ------------------------------------------------------------
-                N_q = attn_map.shape[-2]
-                N_k = attn_map.shape[-1]
+                N_q = a_out.shape[-2]
+                N_k = a_out.shape[-1]
 
                 # In the self-attention layers where this filtering is used,
                 # query and key positions correspond to the same spatial grid.
@@ -185,56 +186,22 @@ class CACTIFModel:
                 # ------------------------------------------------------------
                 # 2. Strongest attended key for every query pixel
                 # ------------------------------------------------------------
-                #
-                # Original behavior:
-                #
-                #   max_map = attn_map[OUT_INDEX].abs().sum(dim=0)
-                #   max_idx = argmax(max_map, dim=-1)
-                #
-                # With head-aware attention:
-                #
-                #   [H, N_q, N_k]
-                #        -> sum heads
-                #   [N_q, N_k]
-                #        -> argmax over keys
-                #   [N_q]
-                #
-                max_map = attn_map[OUT_INDEX].abs().sum(dim=0)
+                max_map = a_out[OUT_INDEX].abs().sum(dim=0)
                 max_idx = max_map.argmax(dim=-1)                  # [N_q]
 
                 # ------------------------------------------------------------
                 # 3. CONTENT value at each query pixel
                 #    STYLE value at its strongest-attended key
                 # ------------------------------------------------------------
-                #
-                # V[CONTENT_INDEX]:
-                #   [H, N_k, D]
-                #
-                # V[STYLE_INDEX]:
-                #   [H, N_k, D]
-                #
                 v_content = V[CONTENT_INDEX]
                 v_style = V[STYLE_INDEX]
 
-                # CONTENT feature at the current query/key position.
-                #
-                # [H, N_q, D]
                 v_content_q = v_content[:, :N_q, :]
-
-                # STYLE feature at the strongest-attended key for every
-                # query pixel.
-                #
-                # [H, N_q, D]
                 v_style_max = v_style[:, max_idx, :]
 
                 # ------------------------------------------------------------
                 # 4. Pixel-wise similarity
                 # ------------------------------------------------------------
-                #
-                # Cosine similarity independently for every:
-                #   head × query pixel
-                #
-                # [H, N_q]
                 cos = F.cosine_similarity(
                     v_content_q.float(),
                     v_style_max.float(),
@@ -242,10 +209,7 @@ class CACTIFModel:
                     eps=1e-6,
                 )
 
-                # Aggregate heads -> one similarity score per pixel.
-                #
-                # [N_q]
-                score = cos.abs().mean(dim=0)
+                score = cos.abs().mean(dim=0)                    # [N_q]
 
                 # ------------------------------------------------------------
                 # 5. Runway mask at the attention resolution
@@ -255,10 +219,6 @@ class CACTIFModel:
                 if model_self.runway_mask is not None:
                     H_l, W_l = model_self.runway_mask.shape[-2:]
 
-                    # Find a spatial grid whose number of pixels equals N_q.
-                    #
-                    # Unlike sqrt(N_q) alone, this preserves the original
-                    # non-square latent/image aspect ratio.
                     f = int(round((H_l * W_l / N_q) ** 0.5))
 
                     if f > 0 and (H_l // f) * (W_l // f) == N_q:
@@ -276,28 +236,16 @@ class CACTIFModel:
                 # ------------------------------------------------------------
                 # 6. Determine weak pixels/tokens
                 # ------------------------------------------------------------
-                #
-                # IMPORTANT:
-                #
-                # Inside runway:
-                #     pixel-wise threshold using runway_filter_perc
-                #
-                # Outside runway:
-                #     token-wise threshold using filter_perc
-                #
                 weak = torch.zeros_like(score, dtype=torch.bool)
 
                 if rw is None:
-                    # No runway mask -> original global/token-wise behavior.
                     weak = model_self.weak_below_quantile(
                         score,
                         prc_values,
                     )
 
                 else:
-                    # -------------------------
                     # RUNWAY: pixel-wise
-                    # -------------------------
                     if rw.any():
                         weak_runway = model_self.weak_below_quantile(
                             score[rw],
@@ -305,9 +253,7 @@ class CACTIFModel:
                         )
                         weak[rw] = weak_runway
 
-                    # -------------------------
                     # NON-RUNWAY: token-wise
-                    # -------------------------
                     if (~rw).any():
                         weak_non_runway = model_self.weak_below_quantile(
                             score[~rw],
@@ -319,43 +265,25 @@ class CACTIFModel:
                 # 7. Replace weak attention rows
                 # ------------------------------------------------------------
                 #
-                # A query pixel corresponds to one ROW of the attention map:
+                # [N_q] -> [1, 1, N_q, 1]
                 #
-                #   attn_map[..., query_pixel, key_pixel]
-                #
-                # Therefore the mask belongs on N_q, not N_k.
-                #
-                # [N_q]
-                #   -> [1, 1, N_q, 1]
-                #
-                # This is the critical broadcasting fix for the 2048 vs 80
-                # error encountered previously.
                 attn_mask = weak[None, None, :, None]
 
-                attn_map_filtered = torch.where(
+                a_out_filtered = torch.where(
                     attn_mask,
-                    attn_map[CONTENT_INDEX:CONTENT_INDEX + 1],
-                    attn_map[OUT_INDEX:OUT_INDEX + 1],
+                    a_content[OUT_INDEX],
+                    a_out[OUT_INDEX],
                 )
 
-                # Put the filtered OUT branch back into the complete tensor.
-                attn_map_out = attn_map.clone()
-                attn_map_out[OUT_INDEX] = attn_map_filtered[0]
+                # Put filtered OUT branch back into complete tensor.
+                a_out_result = a_out.clone()
+                a_out_result[OUT_INDEX] = a_out_filtered
 
                 # ------------------------------------------------------------
                 # 8. Replace corresponding OUT value positions
                 # ------------------------------------------------------------
                 #
-                # V has:
-                #
-                #   [B_variant, H, N_k, D]
-                #
-                # Since this is self-attention, query and key positions are
-                # spatially aligned. Therefore the weak-pixel mask applies to
-                # the N_k dimension here.
-                #
-                # [N_q]
-                #   -> [1, N_q, 1]
+                # [N_q] -> [1, N_q, 1]
                 #
                 value_mask = weak[None, :, None]
 
@@ -368,7 +296,7 @@ class CACTIFModel:
                 V_filtered = V.clone()
                 V_filtered[OUT_INDEX] = V_out
 
-                return attn_map_out, V_filtered
+                return a_out_result, V_filtered
 
 
 
