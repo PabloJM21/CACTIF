@@ -165,7 +165,7 @@ def parse_args() -> argparse.Namespace:
         type=parse_bool,
         nargs="?",
         const=True,
-        default=False,
+        default=True,
         help="Build a runway mask from the .txt annotation next to each content image "
              "and apply runway-specific AdaIN / attention filtering.",
     )
