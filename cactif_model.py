@@ -149,60 +149,76 @@ class CACTIFModel:
             def attention_filtering(self, model_self, a_out, a_content, V):
                 prc = model_self.config.filter_perc
 
+                # a_out: [H, N, N]
+                # V[CONTENT_INDEX]: [H, N, D]
+                heads, N, D = V[CONTENT_INDEX].shape
+
                 # ------------------------------------------------------------
-                # 1. Compute max-attended style key per query token
+                # 1. Max-attended style key per query token (same as before)
                 # ------------------------------------------------------------
                 max_idx = a_out.sum(dim=0).argmax(dim=-1)          # [N]
                 v_content = V[CONTENT_INDEX]                       # [H,N,D]
                 v_style_at_max = V[STYLE_INDEX][:, max_idx]        # [H,N,D]
 
                 # ------------------------------------------------------------
-                # 2. Restore pixel grid (H,W) from N
-                #    These are known from the UNet block resolution.
-                #    They MUST be stored by the caller before invoking this.
+                # 2. Infer spatial grid (H_px, W_px) from N, using your original 2:1 layout
+                #    N = H_px * W_px, with W_px = 2 * H_px
                 # ------------------------------------------------------------
-                H = model_self.current_h
-                W = model_self.current_w
-                N = H * W
-
-                # reshape attention maps and values into spatial grid
-                a_out_sp     = a_out.view(H, W, -1)                # [H,W,N]
-                a_cont_sp    = a_content.view(H, W, -1)            # [H,W,N]
-                v_cont_sp    = v_content.view(H, W, -1)            # [H,W,D]
-                v_out_sp     = V[OUT_INDEX].view(H, W, -1)         # [H,W,D]
-                v_style_sp   = v_style_at_max.view(H, W, -1)       # [H,W,D]
+                H_px = int(torch.sqrt(torch.tensor(N // 2)))
+                W_px = H_px * 2
+                assert H_px * W_px == N, f"Cannot factor N={N} into 2:1 grid"
 
                 # ------------------------------------------------------------
-                # 3. Pixel-wise cosine similarity
+                # 3. Reshape into pixel grid
+                # ------------------------------------------------------------
+                # Values: [H, N, D] -> [H, H_px, W_px, D]
+                v_cont_sp   = v_content.view(heads, H_px, W_px, D)
+                v_style_sp  = v_style_at_max.view(heads, H_px, W_px, D)
+
+                # Attention maps over keys: [H, N, N] -> [H, H_px, W_px, N]
+                a_out_sp    = a_out.view(heads, H_px, W_px, N)
+                a_cont_sp   = a_content.view(heads, H_px, W_px, N)
+
+                # OUT values: [H, N, D] -> [H, H_px, W_px, D]
+                v_out_sp    = V[OUT_INDEX].view(heads, H_px, W_px, D)
+
+                # ------------------------------------------------------------
+                # 4. Pixel-wise cosine similarity
                 # ------------------------------------------------------------
                 cos = F.cosine_similarity(
                     v_cont_sp.float(),
                     v_style_sp.float(),
                     dim=-1,
-                    eps=1e-6
-                )                                                  # [H,W]
+                    eps=1e-6,
+                )                                                  # [H, H_px, W_px]
 
-                score = cos.abs()                                  # [H,W]
+                # Aggregate over heads → per-pixel score
+                score = cos.abs().sum(dim=0)                       # [H_px, W_px]
 
                 # ------------------------------------------------------------
-                # 4. Pixel-wise quantile threshold
+                # 5. Pixel-wise quantile threshold
                 # ------------------------------------------------------------
                 threshold = torch.quantile(score.flatten(), prc)
-                weak_px = score < threshold                        # [H,W] boolean
+                weak_px = score < threshold                        # [H_px, W_px] bool
+
+                # Broadcast mask over heads and feature/key dims
+                weak_px_h = weak_px.unsqueeze(0)                   # [1, H_px, W_px]
+                weak_px_hk = weak_px_h.unsqueeze(-1)               # [1, H_px, W_px, 1]
 
                 # ------------------------------------------------------------
-                # 5. Pixel-wise replacement of OUT with CONTENT
+                # 6. Pixel-wise replacement of OUT with CONTENT
                 # ------------------------------------------------------------
-                a_out_sp = torch.where(weak_px[..., None], a_cont_sp, a_out_sp)
-                v_out_sp = torch.where(weak_px[..., None], v_cont_sp, v_out_sp)
+                a_out_sp = torch.where(weak_px_hk, a_cont_sp, a_out_sp)
+                v_out_sp = torch.where(weak_px_hk, v_cont_sp, v_out_sp)
 
                 # ------------------------------------------------------------
-                # 6. Restore flattened shapes
+                # 7. Restore flattened shapes
                 # ------------------------------------------------------------
-                a_out = a_out_sp.view(N, -1)                       # [N,N]
-                v_out = v_out_sp.view(N, -1)                       # [N,D]
+                a_out = a_out_sp.view(heads, N, N)                 # [H, N, N]
+                v_out = v_out_sp.view(heads, N, D)                 # [H, N, D]
 
                 return a_out, v_out
+
 
 
             def __call__(self,
