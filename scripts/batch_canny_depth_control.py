@@ -262,20 +262,23 @@ def load_gt_mask(img_path, w, h):
 
 
 
-def build_runway_mask(content_img: Path, crop_square: bool = True):
-    """Runway mask at original-image resolution, center-cropped like image_utils.load_size."""
+def build_runway_mask(content_img: Path, size: int = 512):
+    """Runway mask at original resolution, center-cropped to 2:1 exactly like image_utils.load_size."""
     with Image.open(content_img) as im:
         w, h = im.size
     mask = load_gt_mask(str(content_img), w, h)
     if mask is None:
         return None
-    if crop_square:
-        if h < w:
-            off = (w - h) // 2
-            mask = mask[:, off:off + h]
-        elif w < h:
-            off = (h - w) // 2
-            mask = mask[off:off + w, :]
+
+    ideal_aspect = 2.0                      # (size * 2) / size
+    if w / float(h) > ideal_aspect:         # crop left/right
+        new_w = int(ideal_aspect * h)
+        off = (w - new_w) / 2
+        mask = mask[:, int(round(off)): int(round(w - off))]
+    else:                                   # crop top/bottom
+        new_h = int(w / ideal_aspect)
+        off = (h - new_h) / 2
+        mask = mask[int(round(off)): int(round(h - off)), :]
     return mask
 
 
@@ -347,11 +350,11 @@ def run_style_transfer(
         # Runway mask (content image only). Always reset so a mask never leaks between images.
         model.set_runway_mask(None)  # always reset so a mask never leaks between images
         if use_masks:
-            mask = build_runway_mask(content_img, crop_square=True)
+            mask = build_runway_mask(content_img)
             if mask is None:
                 print(f"  Warning: no usable .txt annotation for {content_img.name}; running without mask.")
             else:
-                style_mask = build_runway_mask(style_img, crop_square=True)   # None if no .txt
+                style_mask = build_runway_mask(style_img)   # None if no .txt
                 ref = latents_content[0] if isinstance(latents_content, (list, tuple)) else latents_content
                 model.set_runway_mask(mask, latent_hw=ref.shape[-2:], device=ref.device, style_mask=style_mask)
                 # overlay saving unchanged
