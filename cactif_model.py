@@ -222,6 +222,9 @@ class CACTIFModel:
                 
                 if input_ndim == 4:
                     batch_size, channel, height, width = hidden_states.shape
+                    # Store spatial resolution for pixel-granular filtering
+                    model_self.current_h = height
+                    model_self.current_w = width
                     hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
 
                 batch_size, sequence_length, _ = (
