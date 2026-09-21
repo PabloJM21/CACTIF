@@ -351,9 +351,10 @@ def run_style_transfer(
             if mask is None:
                 print(f"  Warning: no usable .txt annotation for {content_img.name}; running without mask.")
             else:
-                print(f"Running with mask")
+                style_mask = build_runway_mask(style_img, crop_square=True)   # None if no .txt
                 ref = latents_content[0] if isinstance(latents_content, (list, tuple)) else latents_content
-                model.set_runway_mask(mask, latent_hw=ref.shape[-2:], device=ref.device)
+                model.set_runway_mask(mask, latent_hw=ref.shape[-2:], device=ref.device, style_mask=style_mask)
+                # overlay saving unchanged
 
                 overlay_path = output_path.parent / "mask_overlays" / f"{content_img.stem}.png"
                 save_mask_overlay(content_img, mask, overlay_path)

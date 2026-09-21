@@ -11,7 +11,16 @@ from models.stable_diffusion import CrossImageAttentionStableDiffusionPipeline
 from utils import attention_utils
 from utils.adain import adain, custom_adain_pixel
 from utils.model_utils import get_stable_diffusion_model
-import cv2
+
+import torch.nn.functional as F  # already imported
+
+def _masked_stats(z, m, eps=1e-5):
+    """Eqs. 3-4. z: [C,H,W], m: [1,H,W] in {0,1} -> mu, sigma: [C,1,1]."""
+    n = m.sum().clamp(min=1.0)
+    mu = (z * m).sum(dim=(-2, -1), keepdim=True) / n
+    var = (m * (z - mu) ** 2).sum(dim=(-2, -1), keepdim=True) / n
+    return mu, (var + eps).sqrt()
+
 
 
 class CACTIFModel:
@@ -39,11 +48,65 @@ class CACTIFModel:
         self.enable_edit = False
         self.step = 0
 
-        # Runway-related
-        self.runway_mask = None            # [1, h, w] float in [0, 1], latent resolution
+        self.runway_mask = None            # [1,H,W] float at latent resolution
+        self.runway_style_mask = None      # same, or None if style has no annotation
+        self._runway_tokens = {}           # N -> [N] bool, cache per attention layer
         self.runway_filter_perc = 0.5
         self.runway_adain_perc = 0.5
-        self._runway_token_cache = {}
+
+
+    def set_runway_mask(self, mask, latent_hw=None, device=None, style_mask=None):
+        """mask / style_mask: numpy [H,W] in {0,1} at image resolution, or None to reset."""
+        self._runway_tokens = {}
+        self.runway_mask, self.runway_style_mask = None, None
+        if mask is None:
+            return
+
+        def to_latent(m):
+            t = torch.as_tensor(m, dtype=torch.float32, device=device)[None, None]
+            return (F.interpolate(t, size=tuple(latent_hw), mode="area")[0] > 0.5).float()  # [1,H,W]
+
+        self.runway_mask = to_latent(mask)
+        if style_mask is not None:
+            self.runway_style_mask = to_latent(style_mask)
+
+    def get_runway_tokens(self, n_tokens: int):
+        """Runway mask flattened to the token grid of a layer with n_tokens tokens."""
+        if self.runway_mask is None:
+            return None
+        if n_tokens in self._runway_tokens:
+            return self._runway_tokens[n_tokens]
+        H, W = self.runway_mask.shape[-2:]
+        tokens = None
+        for f in (1, 2, 4, 8, 16):
+            if H % f == 0 and W % f == 0 and (H // f) * (W // f) == n_tokens:
+                m = F.interpolate(self.runway_mask[None], size=(H // f, W // f), mode="area")[0, 0]
+                tokens = (m > 0.5).flatten()
+                break
+        self._runway_tokens[n_tokens] = tokens
+        return tokens
+
+    def runway_adain(self, x, s):
+        """Class-wise AdaIN (Eqs. 3-5) with classes {runway, background}.
+        Strength runway_adain_perc is applied inside the runway only."""
+        x32, s32 = x.float(), s.float()
+        m_c = self.runway_mask.to(x32.device)
+        m_s = None if self.runway_style_mask is None else self.runway_style_mask.to(x32.device)
+        ones = torch.ones_like(m_c)
+
+        adained = x32.clone()
+        classes = [(m_c, m_s), (1.0 - m_c, None if m_s is None else 1.0 - m_s)]
+        for mx, my in classes:
+            if mx.sum() < 2:
+                continue
+            mu_x, sd_x = _masked_stats(x32, mx)
+            # Style stats: class mask if available, otherwise global (Eq. 2)
+            mu_y, sd_y = _masked_stats(s32, my if (my is not None and my.sum() >= 2) else ones)
+            cls_out = sd_y * (x32 - mu_x) / sd_x + mu_y                      # Eq. 5
+            adained = torch.where(mx.bool(), cls_out, adained)
+
+        lam = m_c * self.runway_adain_perc + (1.0 - m_c)                     # strength only in runway
+        return (x32 + lam * (adained - x32)).to(x.dtype)
 
     def set_onehot_masks(self):
         """
@@ -74,41 +137,6 @@ class CACTIFModel:
         self.zs_style = zs_style
         self.zs_content = zs_content
 
-    def set_runway_mask(self, mask_np, latent_hw=None, device=None, feather_sigma: float = 1.0):
-        """mask_np: (H, W) float32 in {0,1} (already cropped like the content image), or None."""
-        self._runway_token_cache = {}
-        if mask_np is None:
-            self.runway_mask = None
-            return
-        lat_h, lat_w = latent_hw
-        m = cv2.resize(mask_np, (int(lat_w), int(lat_h)), interpolation=cv2.INTER_AREA)
-        if feather_sigma > 0:
-            m = cv2.GaussianBlur(m, (0, 0), feather_sigma)
-        self.runway_mask = torch.from_numpy(m).float().unsqueeze(0).to(device)
-
-    def get_runway_tokens(self, n_tokens: int, device):
-        """Boolean [N] runway-token mask for a layer with N tokens, or None."""
-        if self.runway_mask is None:
-            return None
-        if n_tokens not in self._runway_token_cache:
-            side = int(round(n_tokens ** 0.5))
-            if side * side != n_tokens:
-                self._runway_token_cache[n_tokens] = None
-            else:
-                m = F.interpolate(self.runway_mask[None], size=(side, side), mode="area")
-                self._runway_token_cache[n_tokens] = (m[0, 0] >= 0.5).flatten()
-        tok = self._runway_token_cache[n_tokens]
-        return None if tok is None else tok.to(device)
-
-    @staticmethod
-    def weak_below_quantile(score: torch.Tensor, q: float) -> torch.Tensor:
-        """Bool mask of tokens whose score is below the q-quantile (q=0 -> none, q>=1 -> all)."""
-        if q <= 0.0:
-            return torch.zeros_like(score, dtype=torch.bool)
-        if q >= 1.0:
-            return torch.ones_like(score, dtype=torch.bool)
-        return score < torch.quantile(score, q)
-
     def get_adain_callback(self) -> Callable:
         """
         Returns a callback function for AdaIN or class-AdaIN based on the current step and config.
@@ -116,18 +144,13 @@ class CACTIFModel:
         def callback(st: int, t: int, latents: torch.FloatTensor) -> None:
             self.step = st
 
-            if self.config.class_adain_range.start <= self.step < self.config.class_adain_range.end and self.config.adain_class:
-                # Apply class-wise AdaIN
+            if self.runway_mask is not None:
+                latents[0] = self.runway_adain(latents[0], latents[1])
+            elif self.config.class_adain_range.start <= self.step < self.config.class_adain_range.end and self.config.adain_class:
                 latents[0] = custom_adain_pixel(latents[0], latents[1], self.label_content_adain, self.label_style_adain)
             else:
-                adained = adain(latents[0], latents[1])
-                if self.runway_mask is not None:
-                    # AdaIN weight per pixel: 1 outside the runway, runway_adain_perc inside
-                    w = 1.0 + (self.runway_adain_perc - 1.0) * self.runway_mask.to(adained.dtype)
-                    latents[0] = w * adained + (1.0 - w) * latents[0]
-                else:
-                    latents[0] = adained
-
+                latents[0] = adain(latents[0], latents[1])
+        
         return callback
 
     def register_attention_control(self):
@@ -146,80 +169,34 @@ class CACTIFModel:
                         "AttentionProcessor requires torch 2.0+. Please upgrade your torch installation."
                     )
 
-            def attention_filtering(self, model_self, a_out, a_content, V):
-                prc = model_self.config.filter_perc
+            def _threshold(self, model_self, s):
+                """tau per head and per query row. s: [H,N] -> [H,1] or [H,N]."""
+                N = s.shape[-1]
+                p_bg = model_self.config.filter_perc
+                rt = model_self.get_runway_tokens(N)
 
-                # a_out: [H, N, N]
-                # V[CONTENT_INDEX]: [H, N, D]
-                heads, N, D = V[CONTENT_INDEX].shape
+                n_rt = 0 if rt is None else int(rt.sum())
+                if n_rt == 0:
+                    return torch.quantile(s, p_bg, dim=-1, keepdim=True)
+                tau_rt = torch.quantile(s[:, rt], model_self.runway_filter_perc, dim=-1, keepdim=True)
+                if n_rt == N:
+                    return tau_rt
+                tau_bg = torch.quantile(s[:, ~rt], p_bg, dim=-1, keepdim=True)
+                return torch.where(rt[None, :], tau_rt, tau_bg)              # [H,N]
 
-                # ------------------------------------------------------------
-                # 1. Max-attended style key per query token (same as before)
-                # ------------------------------------------------------------
-                max_idx = a_out.sum(dim=0).argmax(dim=-1)          # [N]
-                v_content = V[CONTENT_INDEX]                       # [H,N,D]
-                v_style_at_max = V[STYLE_INDEX][:, max_idx]        # [H,N,D]
+            def attention_filtering(self, model_self, a_out, hidden, value):
+                D = value.shape[-1]
+                v_style, v_content = value[STYLE_INDEX], value[CONTENT_INDEX]
 
-                # ------------------------------------------------------------
-                # 2. Infer spatial grid (H_px, W_px) from N, using your original 2:1 layout
-                #    N = H_px * W_px, with W_px = 2 * H_px
-                # ------------------------------------------------------------
-                H_px = int(torch.sqrt(torch.tensor(N // 2)))
-                W_px = H_px * 2
-                assert H_px * W_px == N, f"Cannot factor N={N} into 2:1 grid"
+                m = a_out.argmax(dim=-1)                                                   # [H,N]
+                v_style_at_m = torch.gather(v_style, 1, m.unsqueeze(-1).expand(-1, -1, D))
+                s = F.cosine_similarity(v_content.float(), v_style_at_m.float(), dim=-1, eps=1e-6)
 
-                # ------------------------------------------------------------
-                # 3. Reshape into pixel grid
-                # ------------------------------------------------------------
-                # Values: [H, N, D] -> [H, H_px, W_px, D]
-                v_cont_sp   = v_content.view(heads, H_px, W_px, D)
-                v_style_sp  = v_style_at_max.view(heads, H_px, W_px, D)
+                tau = self._threshold(model_self, s)
+                weak = (s < tau).unsqueeze(-1)                                             # [H,N,1]
 
-                # Attention maps over keys: [H, N, N] -> [H, H_px, W_px, N]
-                a_out_sp    = a_out.view(heads, H_px, W_px, N)
-                a_cont_sp   = a_content.view(heads, H_px, W_px, N)
-
-                # OUT values: [H, N, D] -> [H, H_px, W_px, D]
-                v_out_sp    = V[OUT_INDEX].view(heads, H_px, W_px, D)
-
-                # ------------------------------------------------------------
-                # 4. Pixel-wise cosine similarity
-                # ------------------------------------------------------------
-                cos = F.cosine_similarity(
-                    v_cont_sp.float(),
-                    v_style_sp.float(),
-                    dim=-1,
-                    eps=1e-6,
-                )                                                  # [H, H_px, W_px]
-
-                # Aggregate over heads → per-pixel score
-                score = cos.abs().sum(dim=0)                       # [H_px, W_px]
-
-                # ------------------------------------------------------------
-                # 5. Pixel-wise quantile threshold
-                # ------------------------------------------------------------
-                threshold = torch.quantile(score.flatten(), prc)
-                weak_px = score < threshold                        # [H_px, W_px] bool
-
-                # Broadcast mask over heads and feature/key dims
-                weak_px_h = weak_px.unsqueeze(0)                   # [1, H_px, W_px]
-                weak_px_hk = weak_px_h.unsqueeze(-1)               # [1, H_px, W_px, 1]
-
-                # ------------------------------------------------------------
-                # 6. Pixel-wise replacement of OUT with CONTENT
-                # ------------------------------------------------------------
-                a_out_sp = torch.where(weak_px_hk, a_cont_sp, a_out_sp)
-                v_out_sp = torch.where(weak_px_hk, v_cont_sp, v_out_sp)
-
-                # ------------------------------------------------------------
-                # 7. Restore flattened shapes
-                # ------------------------------------------------------------
-                a_out = a_out_sp.view(heads, N, N)                 # [H, N, N]
-                v_out = v_out_sp.view(heads, N, D)                 # [H, N, D]
-
-                return a_out, v_out
-
-
+                cross_out = a_out @ v_style
+                return torch.where(weak, hidden[CONTENT_INDEX], cross_out)
 
             def __call__(self,
                          attn,
@@ -235,36 +212,10 @@ class CACTIFModel:
                     hidden_states = attn.spatial_norm(hidden_states, temb)
 
                 input_ndim = hidden_states.ndim
-
-                #print(f"input_ndim: {input_ndim}")
+                
                 if input_ndim == 4:
                     batch_size, channel, height, width = hidden_states.shape
-                    # Store spatial resolution for pixel-granular filtering
-                    model_self.current_h = height
-                    model_self.current_w = width
                     hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-                else:
-                    # input_ndim == 3 → infer H,W from block identity
-                    seq_len = hidden_states.shape[1]
-                    # seq_len = H * W
-                    # UNet resolutions are known from the architecture
-                    place = self.place_in_unet
-
-                    if "down_1" in place:  H, W = 128, 128
-                    elif "down_2" in place: H, W = 64, 64
-                    elif "down_3" in place: H, W = 32, 32
-                    elif "down_4" in place: H, W = 16, 16
-                    elif "mid"    in place: H, W = 16, 16
-                    elif "up_1"   in place: H, W = 16, 16
-                    elif "up_2"   in place: H, W = 32, 32
-                    elif "up_3"   in place: H, W = 64, 64
-                    elif "up_4"   in place: H, W = 128, 128
-                    else:
-                        raise RuntimeError(f"Unknown UNet block: {place}")
-
-                    # store for filtering
-                    model_self.current_h = H
-                    model_self.current_w = W
 
                 batch_size, sequence_length, _ = (
                     hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
