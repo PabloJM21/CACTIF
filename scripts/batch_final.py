@@ -475,9 +475,9 @@ def run_style_transfer(
 
     if use_masks and mask is not None:
         # Overlay is cropped the same way so it stays aligned with the saved output image.
-        overlay_path = output_path.parent / "mask_overlays" / f"{content_img.stem}.png"
-        save_mask_overlay(content_img, mask, overlay_path, crop_top=crop_top, target_h=OUTPUT_TARGET_HEIGHT)
-        print(f"  Saved mask overlay: {overlay_path}")
+        #overlay_path = output_path.parent / "mask_overlays" / f"{content_img.stem}.png"
+        #save_mask_overlay(content_img, mask, overlay_path, crop_top=crop_top, target_h=OUTPUT_TARGET_HEIGHT)
+        #print(f"  Saved mask overlay: {overlay_path}")
 
         # Runway corners for the cropped output, in the same file format as the source annotation,
         # saved next to the output image (not in the mask_overlays folder).
