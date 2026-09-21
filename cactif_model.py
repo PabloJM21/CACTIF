@@ -146,162 +146,63 @@ class CACTIFModel:
                         "AttentionProcessor requires torch 2.0+. Please upgrade your torch installation."
                     )
 
-            def attention_filtering(self, model_self: CACTIFModel, a_out, a_content, V):
-                """
-                Hybrid selective attention filtering.
-
-                Inside runway:
-                    Pixel-wise filtering.
-                    Each query pixel gets its own CONTENT-vs-STYLE similarity score.
-
-                Outside runway:
-                    Token-wise filtering.
-                    Weak query tokens are replaced according to filter_perc.
-
-                Shapes:
-                    a_out:     [B_variant, H, N_q, N_k]
-                    a_content: [B_variant, H, N_q, N_k]
-                    V:         [B_variant, H, N_k, D]
-
-                Only OUT_INDEX is modified.
-                """
-
-                prc_values = model_self.config.filter_perc
-                runway_prc = model_self.runway_filter_perc
+            def attention_filtering(self, model_self, a_out, a_content, V):
+                prc = model_self.config.filter_perc
 
                 # ------------------------------------------------------------
-                # 1. Number of query pixels/tokens
+                # 1. Compute max-attended style key per query token
                 # ------------------------------------------------------------
-                N_q = a_out.shape[-2]
-                N_k = a_out.shape[-1]
-
-                # In the self-attention layers where this filtering is used,
-                # query and key positions correspond to the same spatial grid.
-                if N_q != N_k:
-                    raise RuntimeError(
-                        f"CACTIF attention filtering expects self-attention "
-                        f"with N_q == N_k, got N_q={N_q}, N_k={N_k}"
-                    )
+                max_idx = a_out.sum(dim=0).argmax(dim=-1)          # [N]
+                v_content = V[CONTENT_INDEX]                       # [H,N,D]
+                v_style_at_max = V[STYLE_INDEX][:, max_idx]        # [H,N,D]
 
                 # ------------------------------------------------------------
-                # 2. Strongest attended key for every query pixel
+                # 2. Restore pixel grid (H,W) from N
+                #    These are known from the UNet block resolution.
+                #    They MUST be stored by the caller before invoking this.
                 # ------------------------------------------------------------
-                max_map = a_out[OUT_INDEX].abs().sum(dim=0)
-                max_idx = max_map.argmax(dim=-1)                  # [N_q]
+                H = model_self.current_h
+                W = model_self.current_w
+                N = H * W
+
+                # reshape attention maps and values into spatial grid
+                a_out_sp     = a_out.view(H, W, -1)                # [H,W,N]
+                a_cont_sp    = a_content.view(H, W, -1)            # [H,W,N]
+                v_cont_sp    = v_content.view(H, W, -1)            # [H,W,D]
+                v_out_sp     = V[OUT_INDEX].view(H, W, -1)         # [H,W,D]
+                v_style_sp   = v_style_at_max.view(H, W, -1)       # [H,W,D]
 
                 # ------------------------------------------------------------
-                # 3. CONTENT value at each query pixel
-                #    STYLE value at its strongest-attended key
-                # ------------------------------------------------------------
-                v_content = V[CONTENT_INDEX]      # [N_q, D]
-                v_style   = V[STYLE_INDEX]        # [N_q, D]
-
-                v_content_q = v_content           # [N_q, D]
-                v_style_max = v_style[max_idx]    # [N_q, D]
-
-
-                # ------------------------------------------------------------
-                # 4. Pixel-wise similarity
+                # 3. Pixel-wise cosine similarity
                 # ------------------------------------------------------------
                 cos = F.cosine_similarity(
-                    v_content_q.float(),
-                    v_style_max.float(),
+                    v_cont_sp.float(),
+                    v_style_sp.float(),
                     dim=-1,
-                    eps=1e-6,
-                )
+                    eps=1e-6
+                )                                                  # [H,W]
 
-                score = cos.abs().mean(dim=0)                    # [N_q]
-
-                # ------------------------------------------------------------
-                # 5. Runway mask at the attention resolution
-                # ------------------------------------------------------------
-                rw = None
-
-                if model_self.runway_mask is not None:
-                    H_l, W_l = model_self.runway_mask.shape[-2:]
-
-                    f = int(round((H_l * W_l / N_q) ** 0.5))
-
-                    if f > 0 and (H_l // f) * (W_l // f) == N_q:
-                        h = H_l // f
-                        w = W_l // f
-
-                        m = F.interpolate(
-                            model_self.runway_mask[None],
-                            size=(h, w),
-                            mode="area",
-                        )
-
-                        rw = (m[0, 0] >= 0.5).flatten().to(score.device)
+                score = cos.abs()                                  # [H,W]
 
                 # ------------------------------------------------------------
-                # 6. Determine weak pixels/tokens
+                # 4. Pixel-wise quantile threshold
                 # ------------------------------------------------------------
-                weak = torch.zeros_like(score, dtype=torch.bool)
-
-                if rw is None:
-                    weak = model_self.weak_below_quantile(
-                        score,
-                        prc_values,
-                    )
-
-                else:
-                    # RUNWAY: pixel-wise
-                    if rw.any():
-                        weak_runway = model_self.weak_below_quantile(
-                            score[rw],
-                            runway_prc,
-                        )
-                        weak[rw] = weak_runway
-
-                    # NON-RUNWAY: token-wise
-                    if (~rw).any():
-                        weak_non_runway = model_self.weak_below_quantile(
-                            score[~rw],
-                            prc_values,
-                        )
-                        weak[~rw] = weak_non_runway
+                threshold = torch.quantile(score.flatten(), prc)
+                weak_px = score < threshold                        # [H,W] boolean
 
                 # ------------------------------------------------------------
-                # 7. Replace weak attention rows
+                # 5. Pixel-wise replacement of OUT with CONTENT
                 # ------------------------------------------------------------
-                #
-                # [N_q] -> [1, 1, N_q, 1]
-                #
-                attn_mask = weak[None, None, :, None]
-
-                a_out_filtered = torch.where(
-                    attn_mask,
-                    a_content[OUT_INDEX],
-                    a_out[OUT_INDEX],
-                )
-
-                # Put filtered OUT branch back into complete tensor.
-                a_out_result = a_out.clone()
-                a_out_result[OUT_INDEX] = a_out_filtered
+                a_out_sp = torch.where(weak_px[..., None], a_cont_sp, a_out_sp)
+                v_out_sp = torch.where(weak_px[..., None], v_cont_sp, v_out_sp)
 
                 # ------------------------------------------------------------
-                # 8. Replace corresponding OUT value positions
+                # 6. Restore flattened shapes
                 # ------------------------------------------------------------
-                #
-                # [N_q] -> [1, N_q, 1]
-                #
-                value_mask = weak[None, :, None]
+                a_out = a_out_sp.view(N, -1)                       # [N,N]
+                v_out = v_out_sp.view(N, -1)                       # [N,D]
 
-                V_out = torch.where(
-                    value_mask,
-                    v_content,
-                    V[OUT_INDEX],
-                )
-
-                V_filtered = V.clone()
-                V_filtered[OUT_INDEX] = V_out
-
-                return a_out_result, V_filtered
-
-
-
-
+                return a_out, v_out
 
 
             def __call__(self,
@@ -311,14 +212,14 @@ class CACTIFModel:
                          attention_mask=None,
                          temb=None,
                          perform_swap: bool = False):
-
+                
                 residual = hidden_states
 
                 if attn.spatial_norm is not None:
                     hidden_states = attn.spatial_norm(hidden_states, temb)
 
                 input_ndim = hidden_states.ndim
-
+                
                 if input_ndim == 4:
                     batch_size, channel, height, width = hidden_states.shape
                     hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
@@ -334,10 +235,11 @@ class CACTIFModel:
                 if attn.group_norm is not None:
                     hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
+                    
                 is_cross = encoder_hidden_states is not None
-
+                
                 query = attn.to_q(hidden_states)
-
+                
                 if not is_cross:
                     encoder_hidden_states = hidden_states
                 elif attn.norm_cross:
@@ -345,11 +247,11 @@ class CACTIFModel:
 
                 key = attn.to_k(encoder_hidden_states)
                 value = attn.to_v(encoder_hidden_states)
-
+                
                 inner_dim = key.shape[-1]
                 head_dim = inner_dim // attn.heads
                 should_mix = False
-
+                
                 # Potentially apply cross image attention operation
                 # To do so, we need to be in a self-attention layer in the decoder part of the denoising network
                 if model_self.config.cross_attention:
@@ -363,7 +265,7 @@ class CACTIFModel:
                 query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
                 key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
                 value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
+                
                 do_edit = perform_swap and model_self.enable_edit and should_mix and not is_cross
                 use_filter = do_edit and model_self.config.filtering
 
@@ -377,9 +279,9 @@ class CACTIFModel:
 
                 if use_filter:
                     a_out, v_out = self.attention_filtering(model_self, *maps, value)
-                    # Only OUT_INDEX branch changes
-                    hidden_states[OUT_INDEX] = a_out[OUT_INDEX] @ v_out[OUT_INDEX]
-
+                    hidden_states[OUT_INDEX] = a_out @ v_out      # only the OUT element changes
+                
+                      
                 hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
                 hidden_states = hidden_states.to(query[OUT_INDEX].dtype)
 
@@ -395,7 +297,7 @@ class CACTIFModel:
                     hidden_states = hidden_states + residual
 
                 hidden_states = hidden_states / attn.rescale_output_factor
-
+                
                 return hidden_states
 
         def register_recr(net_, count, place_in_unet):
