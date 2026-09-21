@@ -44,10 +44,10 @@ def compute_scaled_dot_product_attention(Q, K, V, edit_map=False, is_cross=False
     a_out = a_out.sub_(mu).mul_(contrast_strength).add_(mu).clamp_(0.0, 1.0)
 
     if return_maps:
-        a_content = torch.softmax(
-            (Q[CONTENT_INDEX] @ K[CONTENT_INDEX].transpose(-2, -1)) * scale, dim=-1
-        )
-        return hidden, (a_out, a_content)   # caller overwrites hidden[OUT_INDEX] after filtering
+        #a_content = torch.softmax(
+            #(Q[CONTENT_INDEX] @ K[CONTENT_INDEX].transpose(-2, -1)) * scale, dim=-1
+        #)
+        return hidden, a_out        # a_out: [H,N,N], contrast-enhanced cross-image attention
 
     hidden[OUT_INDEX] = a_out @ V[OUT_INDEX]
     return hidden, None

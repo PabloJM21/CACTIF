@@ -278,7 +278,9 @@ class CACTIFModel:
                 )
 
                 if use_filter:
-                    hidden_states[OUT_INDEX] = self.attention_filtering(model_self, maps, hidden_states, value)
+                    hidden_states[OUT_INDEX] = self.attention_filtering(
+                        model_self, maps, hidden_states, value
+                )
                 
                       
                 hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
