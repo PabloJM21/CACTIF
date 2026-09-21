@@ -220,13 +220,35 @@ class CACTIFModel:
 
                 input_ndim = hidden_states.ndim
 
-                print(f"input_ndim: {input_ndim}")
+                #print(f"input_ndim: {input_ndim}")
                 if input_ndim == 4:
                     batch_size, channel, height, width = hidden_states.shape
                     # Store spatial resolution for pixel-granular filtering
                     model_self.current_h = height
                     model_self.current_w = width
                     hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+                else:
+                    # input_ndim == 3 → infer H,W from block identity
+                    seq_len = hidden_states.shape[1]
+                    # seq_len = H * W
+                    # UNet resolutions are known from the architecture
+                    place = self.place_in_unet
+
+                    if "down_1" in place:  H, W = 128, 128
+                    elif "down_2" in place: H, W = 64, 64
+                    elif "down_3" in place: H, W = 32, 32
+                    elif "down_4" in place: H, W = 16, 16
+                    elif "mid"    in place: H, W = 16, 16
+                    elif "up_1"   in place: H, W = 16, 16
+                    elif "up_2"   in place: H, W = 32, 32
+                    elif "up_3"   in place: H, W = 64, 64
+                    elif "up_4"   in place: H, W = 128, 128
+                    else:
+                        raise RuntimeError(f"Unknown UNet block: {place}")
+
+                    # store for filtering
+                    model_self.current_h = H
+                    model_self.current_w = W
 
                 batch_size, sequence_length, _ = (
                     hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
