@@ -219,7 +219,8 @@ class CACTIFModel:
                     hidden_states = attn.spatial_norm(hidden_states, temb)
 
                 input_ndim = hidden_states.ndim
-                
+
+                print(f"input_ndim: {input_ndim}")
                 if input_ndim == 4:
                     batch_size, channel, height, width = hidden_states.shape
                     # Store spatial resolution for pixel-granular filtering
