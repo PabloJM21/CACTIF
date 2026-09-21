@@ -175,8 +175,8 @@ class CACTIFModel:
                 weak = (s < tau).unsqueeze(-1)                                             # [H,N,1]
 
                 cross_out = a_out @ v_style
-                print(tuple(s.shape), tuple(tau.shape), tuple(weak.shape),
-                    tuple(hidden[CONTENT_INDEX].shape), tuple(cross_out.shape))
+                #print(tuple(s.shape), tuple(tau.shape), tuple(weak.shape),
+                    #tuple(hidden[CONTENT_INDEX].shape), tuple(cross_out.shape))
                 return torch.where(weak, hidden[CONTENT_INDEX], cross_out)
 
             def __call__(self,
