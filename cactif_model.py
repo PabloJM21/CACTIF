@@ -185,7 +185,12 @@ class CACTIFModel:
                 return torch.where(rt[None, :], tau_rt, tau_bg)              # [H,N]
 
             def attention_filtering(self, model_self, a_out, hidden, value):
+                H, N, _ = a_out.shape
                 D = value.shape[-1]
+                assert hidden.shape == value.shape == (hidden.shape[0], H, N, D), (
+                    f"a_out {tuple(a_out.shape)}, hidden {tuple(hidden.shape)}, value {tuple(value.shape)}"
+                )
+
                 v_style, v_content = value[STYLE_INDEX], value[CONTENT_INDEX]
 
                 m = a_out.argmax(dim=-1)                                                   # [H,N]
@@ -196,6 +201,8 @@ class CACTIFModel:
                 weak = (s < tau).unsqueeze(-1)                                             # [H,N,1]
 
                 cross_out = a_out @ v_style
+                print(tuple(s.shape), tuple(tau.shape), tuple(weak.shape),
+                    tuple(hidden[CONTENT_INDEX].shape), tuple(cross_out.shape))
                 return torch.where(weak, hidden[CONTENT_INDEX], cross_out)
 
             def __call__(self,
@@ -271,8 +278,7 @@ class CACTIFModel:
                 )
 
                 if use_filter:
-                    a_out, v_out = self.attention_filtering(model_self, *maps, value)
-                    hidden_states[OUT_INDEX] = a_out @ v_out      # only the OUT element changes
+                    hidden_states[OUT_INDEX] = self.attention_filtering(model_self, maps, hidden_states, value)
                 
                       
                 hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
