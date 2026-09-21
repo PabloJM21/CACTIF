@@ -135,3 +135,59 @@ def calc_mean_std_2d(feat, eps=1e-5, mask=None):
         feat_mean = feat.view(C, -1).mean(dim=1).view(C, 1)
 
     return feat_mean, feat_std
+
+
+import torch.nn.functional as F
+
+
+def _weighted_stats(feat, w, eps=1e-5):
+    """Same math as calc_mean_std_smooth, on a soft weight map. feat: [C,H,W], w: [1,H,W]."""
+    n = w.sum().clamp(min=1e-8)
+    mu = (feat * w).sum(dim=(-2, -1), keepdim=True) / n
+    var = (w * (feat - mu) ** 2).sum(dim=(-2, -1), keepdim=True) / n
+    return mu, (var + eps).sqrt()
+
+
+def _erode(w, k=3):
+    """Grayscale erosion (min-pool); counterpart of binary_erosion in process_mask."""
+    return -F.max_pool2d(-w[None], k, stride=1, padding=k // 2)[0]
+
+
+def _class_stats(feat, w, min_weight, erode):
+    """Class stats as in custom_adain_pixel: eroded mask if enough weight survives, and
+    None (-> identity) if the class has too little support to give meaningful statistics."""
+    if erode:
+        w_er = _erode(w)
+        if w_er.sum() >= min_weight:
+            w = w_er
+    if w.sum() < min_weight:
+        return None
+    return _weighted_stats(feat, w)
+
+
+def runway_adain(content_feat, style_feat, content_mask, style_mask=None,
+                 strength=1.0, min_weight=8.0, erode=True):
+    """Class-wise AdaIN (Eqs. 3-5) with classes {runway, background}.
+    content_feat, style_feat: [C,H,W]; masks: soft [1,H,W] in [0,1] at latent resolution.
+    strength: AdaIN strength inside the runway (1 = full Eq. 5, 0 = none).
+    Classes lacking statistics are left unchanged, as in custom_adain_pixel; the exception is
+    the background of a style image with no annotation, which uses global stats (Eq. 2)."""
+    x, s = content_feat.float(), style_feat.float()
+    w_r = content_mask.to(x.device, x.dtype).clamp(0, 1)
+    w_b = 1.0 - w_r
+    ones = torch.ones_like(w_r)
+
+    def class_out(w_c, w_s):
+        cs = _class_stats(x, w_c, min_weight, erode)
+        ss = _class_stats(s, w_s, min_weight, erode) if w_s is not None else None
+        if cs is None or ss is None:
+            return x                                                   # identity
+        (mu_x, sd_x), (mu_y, sd_y) = cs, ss
+        return sd_y * (x - mu_x) / sd_x + mu_y                         # Eq. 5
+
+    m_s = None if style_mask is None else style_mask.to(x.device, x.dtype).clamp(0, 1)
+    out_r = class_out(w_r, m_s)                                        # no style runway -> identity
+    out_r = x + strength * (out_r - x)
+    out_b = class_out(w_b, ones if m_s is None else 1.0 - m_s)         # no style mask -> global
+
+    return (w_r * out_r + w_b * out_b).to(content_feat.dtype)          # soft blend, no seams

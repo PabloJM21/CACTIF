@@ -12,16 +12,7 @@ from utils import attention_utils
 from utils.adain import adain, custom_adain_pixel
 from utils.model_utils import get_stable_diffusion_model
 
-import torch.nn.functional as F  # already imported
-
-def _masked_stats(z, m, eps=1e-5):
-    """Eqs. 3-4. z: [C,H,W], m: [1,H,W] in {0,1} -> mu, sigma: [C,1,1]."""
-    n = m.sum().clamp(min=1.0)
-    mu = (z * m).sum(dim=(-2, -1), keepdim=True) / n
-    var = (m * (z - mu) ** 2).sum(dim=(-2, -1), keepdim=True) / n
-    return mu, (var + eps).sqrt()
-
-
+from utils.adain import adain, custom_adain_pixel, runway_adain
 
 class CACTIFModel:
     """
@@ -64,7 +55,7 @@ class CACTIFModel:
 
         def to_latent(m):
             t = torch.as_tensor(m, dtype=torch.float32, device=device)[None, None]
-            return (F.interpolate(t, size=tuple(latent_hw), mode="area")[0] > 0.5).float()  # [1,H,W]
+            return F.interpolate(t, size=tuple(latent_hw), mode="area")[0]   # soft [1,H,W]
 
         self.runway_mask = to_latent(mask)
         if style_mask is not None:
@@ -86,27 +77,6 @@ class CACTIFModel:
         self._runway_tokens[n_tokens] = tokens
         return tokens
 
-    def runway_adain(self, x, s):
-        """Class-wise AdaIN (Eqs. 3-5) with classes {runway, background}.
-        Strength runway_adain_perc is applied inside the runway only."""
-        x32, s32 = x.float(), s.float()
-        m_c = self.runway_mask.to(x32.device)
-        m_s = None if self.runway_style_mask is None else self.runway_style_mask.to(x32.device)
-        ones = torch.ones_like(m_c)
-
-        adained = x32.clone()
-        classes = [(m_c, m_s), (1.0 - m_c, None if m_s is None else 1.0 - m_s)]
-        for mx, my in classes:
-            if mx.sum() < 2:
-                continue
-            mu_x, sd_x = _masked_stats(x32, mx)
-            # Style stats: class mask if available, otherwise global (Eq. 2)
-            mu_y, sd_y = _masked_stats(s32, my if (my is not None and my.sum() >= 2) else ones)
-            cls_out = sd_y * (x32 - mu_x) / sd_x + mu_y                      # Eq. 5
-            adained = torch.where(mx.bool(), cls_out, adained)
-
-        lam = m_c * self.runway_adain_perc + (1.0 - m_c)                     # strength only in runway
-        return (x32 + lam * (adained - x32)).to(x.dtype)
 
     def set_onehot_masks(self):
         """
@@ -144,8 +114,12 @@ class CACTIFModel:
         def callback(st: int, t: int, latents: torch.FloatTensor) -> None:
             self.step = st
 
-            if self.runway_mask is not None:
-                latents[0] = self.runway_adain(latents[0], latents[1])
+            if self.runway_mask is not None: #  and self.runway_adain_perc > 0
+                latents[0] = runway_adain(
+                    latents[0], latents[1],
+                    self.runway_mask, self.runway_style_mask,
+                    strength=self.runway_adain_perc,
+                )
             elif self.config.class_adain_range.start <= self.step < self.config.class_adain_range.end and self.config.adain_class:
                 latents[0] = custom_adain_pixel(latents[0], latents[1], self.label_content_adain, self.label_style_adain)
             else:
