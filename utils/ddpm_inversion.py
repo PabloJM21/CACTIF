@@ -8,6 +8,10 @@ from tqdm import tqdm
 Inversion code taken from: 
 1. The official implementation of Edit-Friendly DDPM Inversion: https://github.com/inbarhub/DDPM_inversion
 2. The LEDITS demo: https://huggingface.co/spaces/editing-images/ledits/tree/main
+
+Dtype handling: the VAE and UNet may run in fp16, while the inversion math
+(scheduler coefficients, noise maps, latents) is kept in float32. Inputs are cast
+to the module dtype right before each VAE/UNet call, and outputs are cast back to float32.
 """
 
 LOW_RESOURCE = True
@@ -22,10 +26,18 @@ def invert(x0, pipe, prompt_src="", num_diffusion_steps=100, cfg_scale_src=3.5, 
     #  zs - noise maps
     pipe.scheduler.set_timesteps(num_diffusion_steps)
     with inference_mode():
+        # FIX: cast the image to the VAE dtype (fp16) before encoding
         w0 = (pipe.vae.encode(x0.to(pipe.vae.dtype)).latent_dist.mode() * 0.18215).float()
     wt, zs, wts = inversion_forward_process(pipe, w0, etas=eta, prompt=prompt_src, cfg_scale=cfg_scale_src,
                                             prog_bar=True, num_inference_steps=num_diffusion_steps)
     return zs, wts
+
+
+def _predict_noise(model, xt, t, embedding):
+    """UNet noise prediction with inputs cast to the UNet dtype and the result returned in float32."""
+    dt = model.unet.dtype
+    out = model.unet.forward(xt.to(dt), timestep=t, encoder_hidden_states=embedding.to(dt))
+    return out.sample.float()
 
 
 def inversion_forward_process(model, x0,
@@ -65,15 +77,16 @@ def inversion_forward_process(model, x0,
             xt = xts[idx][None]
 
         with torch.no_grad():
-            out = model.unet.forward(xt, timestep=t, encoder_hidden_states=uncond_embedding)
+            # FIX: UNet inputs are cast to the UNet dtype; outputs come back as float32
+            eps_uncond = _predict_noise(model, xt, t, uncond_embedding)
             if not prompt == "":
-                cond_out = model.unet.forward(xt, timestep=t, encoder_hidden_states=text_embeddings)
+                eps_cond = _predict_noise(model, xt, t, text_embeddings)
 
         if not prompt == "":
             ## classifier free guidance
-            noise_pred = out.sample + cfg_scale * (cond_out.sample - out.sample)
+            noise_pred = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
         else:
-            noise_pred = out.sample
+            noise_pred = eps_uncond
 
         if eta_is_zero:
             # 2. compute more noisy image and set x_t -> x_t+1
