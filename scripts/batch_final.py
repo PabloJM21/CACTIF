@@ -533,9 +533,9 @@ def run_style_transfer(
             # Overlay drawn directly from the saved output image + its just-written label,
             # denormalized using the image's own dimensions -- a direct sanity check that the
             # two agree, independent of the crop/mask machinery used to build the label.
-            overlay_path = output_path.parent / "mask_overlays" / f"{content_img.stem}.png"
-            save_output_overlay(output_path, txt_path, overlay_path)
-            print(f"  Saved mask overlay: {overlay_path}")
+            #overlay_path = output_path.parent / "mask_overlays" / f"{content_img.stem}.png"
+            #save_output_overlay(output_path, txt_path, overlay_path)
+            #print(f"  Saved mask overlay: {overlay_path}")
 
 
 # NEW: recompute output .txt files that were written by the buggy load_gt_named_points
