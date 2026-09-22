@@ -397,6 +397,47 @@ def save_mask_overlay(content_img: Path, mask: np.ndarray, out_path: Path, alpha
     out_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(overlay).save(out_path)
 
+
+# NEW: sanity-check overlay -- draws directly on the already-saved OUTPUT image, denormalizing
+# the just-written label file using that image's own dimensions. This is independent of the
+# mask/crop machinery above, so it shows exactly what the saved label actually points to.
+def save_output_overlay(output_path: Path, txt_path: Path, overlay_path: Path, alpha: float = 0.4) -> None:
+    if not txt_path.exists():
+        return
+
+    line = txt_path.read_text(encoding="utf-8").strip()
+    if not line:
+        return
+    values = line.split()
+    if len(values) < 8:
+        return
+
+    x_tl, y_tl, x_bl, y_bl, x_tr, y_tr, x_br, y_br = map(float, values[-8:])
+
+    image = np.array(Image.open(output_path).convert("RGB"))
+    h, w = image.shape[:2]   # denormalize with the OUTPUT image's own dimensions
+
+    pts = np.array(
+        [[x_tl * w, y_tl * h],
+         [x_tr * w, y_tr * h],
+         [x_br * w, y_br * h],
+         [x_bl * w, y_bl * h]],
+        dtype=np.float64,
+    ).astype(np.int32).reshape(-1, 1, 2)
+
+    poly_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(poly_mask, [pts], 255)
+    m = poly_mask > 0
+
+    overlay = image.astype(np.float32)
+    red = np.array([255.0, 0.0, 0.0], dtype=np.float32)
+    overlay[m] = (1.0 - alpha) * overlay[m] + alpha * red
+    overlay = overlay.clip(0, 255).astype(np.uint8)
+    cv2.polylines(overlay, [pts], isClosed=True, color=(255, 255, 0), thickness=1)
+
+    overlay_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(overlay).save(overlay_path)
+
 def collect_content_images(content_dir: Path, image_format: str):
     input_files = sorted(
         path
@@ -481,18 +522,20 @@ def run_style_transfer(
     Image.fromarray(cropped_img).save(output_path)
 
     if use_masks and mask is not None:
-        # Overlay is cropped the same way so it stays aligned with the saved output image.
-        overlay_path = output_path.parent / "mask_overlays" / f"{content_img.stem}.png"
-        save_mask_overlay(content_img, mask, overlay_path, crop_top=crop_top, target_h=OUTPUT_TARGET_HEIGHT)
-        print(f"  Saved mask overlay: {overlay_path}")
-
         # Runway corners for the cropped output, in the same file format as the source annotation,
         # saved next to the output image (not in the mask_overlays folder).
         gt = load_gt_named_points(content_img, out_w=out_w, out_h=out_h)
         if gt is not None:
             prefix_tokens, points = gt
-            save_gt_txt(prefix_tokens, points, crop_top, out_w, OUTPUT_TARGET_HEIGHT,
-                       output_path.with_suffix(".txt"))
+            txt_path = output_path.with_suffix(".txt")
+            save_gt_txt(prefix_tokens, points, crop_top, out_w, OUTPUT_TARGET_HEIGHT, txt_path)
+
+            # Overlay drawn directly from the saved output image + its just-written label,
+            # denormalized using the image's own dimensions -- a direct sanity check that the
+            # two agree, independent of the crop/mask machinery used to build the label.
+            overlay_path = output_path.parent / "mask_overlays" / f"{content_img.stem}.png"
+            save_output_overlay(output_path, txt_path, overlay_path)
+            print(f"  Saved mask overlay: {overlay_path}")
 
 
 # NEW: recompute output .txt files that were written by the buggy load_gt_named_points
