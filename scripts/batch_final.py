@@ -322,6 +322,13 @@ def load_gt_named_points(img_path: Path, out_w: int, out_h: int):
     with Image.open(img_path) as im:
         w, h = im.size
 
+    # The stored coords are normalized fractions of the ORIGINAL image (w, h), same as in
+    # load_gt_points_from_txt -- convert to pixel coordinates before applying the pixel-space crop.
+    x_tl, y_tl = x_tl * w, y_tl * h
+    x_bl, y_bl = x_bl * w, y_bl * h
+    x_tr, y_tr = x_tr * w, y_tr * h
+    x_br, y_br = x_br * w, y_br * h
+
     # Same center-crop-to-2:1 as image_utils.load_size, followed by the resize to (out_w, out_h)
     ideal_aspect = out_w / float(out_h)
     aspect = w / float(h)
@@ -475,9 +482,9 @@ def run_style_transfer(
 
     if use_masks and mask is not None:
         # Overlay is cropped the same way so it stays aligned with the saved output image.
-        #overlay_path = output_path.parent / "mask_overlays" / f"{content_img.stem}.png"
-        #save_mask_overlay(content_img, mask, overlay_path, crop_top=crop_top, target_h=OUTPUT_TARGET_HEIGHT)
-        #print(f"  Saved mask overlay: {overlay_path}")
+        overlay_path = output_path.parent / "mask_overlays" / f"{content_img.stem}.png"
+        save_mask_overlay(content_img, mask, overlay_path, crop_top=crop_top, target_h=OUTPUT_TARGET_HEIGHT)
+        print(f"  Saved mask overlay: {overlay_path}")
 
         # Runway corners for the cropped output, in the same file format as the source annotation,
         # saved next to the output image (not in the mask_overlays folder).
@@ -486,6 +493,50 @@ def run_style_transfer(
             prefix_tokens, points = gt
             save_gt_txt(prefix_tokens, points, crop_top, out_w, OUTPUT_TARGET_HEIGHT,
                        output_path.with_suffix(".txt"))
+
+
+# NEW: recompute output .txt files that were written by the buggy load_gt_named_points
+# (it fed normalized fractions straight into a pixel-space crop instead of converting to
+# pixel coordinates first -- see the x_tl*w / y_tl*h fix above). Rather than algebraically
+# reversing that bug, this re-derives each file from the ORIGINAL, untouched annotation next
+# to the content image, using the same (now-corrected) load_gt_named_points/save_gt_txt used
+# during generation. It overwrites only files whose stem matches a content image with an
+# annotation; anything else is left alone.
+def fix_bad_labels(content_dir: Path, output_dir: Path, image_format: str,
+                   out_w: int = 1024, out_h: int = 512,
+                   target_h: int = OUTPUT_TARGET_HEIGHT) -> None:
+    """
+    content_dir: directory of ORIGINAL content images with their untouched .txt annotations
+                (the same ones used when the images were generated).
+    output_dir: directory containing the previously generated images and the bad .txt files
+               (file stems must match content_dir).
+    out_w, out_h: dimensions of the raw diffusion output, BEFORE the final height crop
+                 (must match what was used for the run being fixed).
+    target_h: the post-crop height the images were saved at (default: OUTPUT_TARGET_HEIGHT).
+    """
+    image_format = normalize_format(image_format)
+    crop_top = (out_h - target_h) // 2
+
+    fixed, skipped = 0, 0
+    for content_img in sorted(content_dir.iterdir()):
+        if not (content_img.is_file() and content_img.suffix.lower() == image_format):
+            continue
+
+        txt_path = output_dir / (content_img.stem + ".txt")
+        if not txt_path.exists():
+            continue  # nothing was written for this image; nothing to fix
+
+        gt = load_gt_named_points(content_img, out_w=out_w, out_h=out_h)
+        if gt is None:
+            print(f"  Warning: no annotation for {content_img.name}; leaving {txt_path.name} untouched.")
+            skipped += 1
+            continue
+
+        prefix_tokens, points = gt
+        save_gt_txt(prefix_tokens, points, crop_top, out_w, target_h, txt_path)
+        fixed += 1
+
+    print(f"fix_bad_labels: rewrote {fixed} file(s), skipped {skipped} (no annotation found).")
 
 
 def main() -> None:
